@@ -1,202 +1,281 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useState, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import type { UserSettings } from '../lib/types';
 
 export const Route = createFileRoute('/panic')({
   component: RouteComponent,
 });
 
-function toEmbedUrl(url: string): string {
-  try {
-    if (url.includes('watch?v=')) {
-      const v = new URL(url).searchParams.get('v');
-      return `https://www.youtube.com/embed/${v}?autoplay=1&mute=0`;
-    }
-    if (url.includes('youtu.be/')) {
-      const v = url.split('youtu.be/')[1].split('?')[0];
-      return `https://www.youtube.com/embed/${v}?autoplay=1&mute=0`;
-    }
-    if (!url.includes('autoplay=1')) {
-      return url + (url.includes('?') ? '&' : '?') + 'autoplay=1';
-    }
-  } catch {
-    /* keep original */
-  }
-  return url;
-}
+const EXIT_MS = 320;
 
 function activeModes(settings: UserSettings): Set<string> {
-  if (settings.panic_mode === 'combo') {
-    return new Set(settings.combo_modes);
+  return settings.panic_mode === 'combo'
+      ? new Set(settings.combo_modes)
+      : new Set([settings.panic_mode]);
+}
+
+function toEmbedUrl(rawUrl: string): string {
+  const value = rawUrl.trim();
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    let videoId = '';
+
+    if (host === 'youtu.be') {
+      videoId = url.pathname.split('/').filter(Boolean)[0] ?? '';
+    } else if (host === 'youtube.com' || host === 'm.youtube.com') {
+      if (url.pathname === '/watch') {
+        videoId = url.searchParams.get('v') ?? '';
+      } else if (url.pathname.startsWith('/shorts/')) {
+        videoId = url.pathname.split('/')[2] ?? '';
+      } else if (url.pathname.startsWith('/embed/')) {
+        videoId = url.pathname.split('/')[2] ?? '';
+      }
+    }
+
+    if (videoId) {
+      return `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?autoplay=1&playsinline=1&controls=0&rel=0&modestbranding=1`;
+    }
+  } catch {
+    // Leave unknown URLs alone; the iframe will handle its own failure.
   }
-  return new Set([settings.panic_mode]);
+
+  return value;
+}
+
+function localVideoUrl(path: string) {
+  const trimmed = path.trim();
+  if (!trimmed) return '';
+  try {
+    return convertFileSrc(trimmed);
+  } catch {
+    return trimmed;
+  }
 }
 
 function RouteComponent() {
   const [settings, setSettings] = useState<UserSettings | null>(null);
   const [screenshot, setScreenshot] = useState<string | null>(null);
   const [stage, setStage] = useState<'enter' | 'active' | 'exit'>('enter');
+  const [mediaError, setMediaError] = useState(false);
+  const closingRef = useRef(false);
+  const timersRef = useRef<number[]>([]);
 
-  const closeOverlay = useCallback(async () => {
-    setStage('exit');
-    setTimeout(async () => {
-      await invoke('close_panic');
-    }, 1000);
+  const clearTimers = useCallback(() => {
+    timersRef.current.forEach((timer) => window.clearTimeout(timer));
+    timersRef.current = [];
   }, []);
 
+  const closeOverlay = useCallback(async () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    clearTimers();
+    setStage('exit');
+    window.setTimeout(() => {
+      void invoke('close_panic').catch((error) => {
+        console.error('[guiso] failed to close panic overlay', error);
+      });
+    }, EXIT_MS);
+  }, [clearTimers]);
+
   useEffect(() => {
+    let cancelled = false;
+
     async function init() {
-      const s = await invoke<UserSettings>('get_settings');
-      setSettings(s);
-      const modes = activeModes(s);
+      try {
+        const loaded = await invoke<UserSettings>('get_settings');
+        if (cancelled) return;
+        setSettings(loaded);
 
-      if (modes.has('glitch')) {
-        const img = await invoke<string | null>('get_last_screenshot');
-        if (img) setScreenshot(img);
-      }
+        const modes = activeModes(loaded);
+        if (modes.has('glitch')) {
+          const image = await invoke<string | null>('get_last_screenshot');
+          if (!cancelled) setScreenshot(image);
+        }
 
-      requestAnimationFrame(() => setStage('active'));
+        requestAnimationFrame(() => {
+          if (!cancelled) setStage('active');
+        });
 
-      const isMedia =
-        s.panic_mode === 'local' ||
-        s.panic_mode === 'youtube' ||
-        (s.panic_mode === 'combo' && s.combo_modes.includes('youtube'));
+        const hasPersistentMedia = modes.has('youtube') || modes.has('local');
+        const hardClose =
+            loaded.panic_auto_close_ms > 0
+                ? loaded.panic_auto_close_ms
+                : hasPersistentMedia
+                    ? 0
+                    : loaded.panic_fade_ms + 1_000;
 
-      if (s.panic_auto_close_ms > 0) {
-        setTimeout(closeOverlay, s.panic_auto_close_ms);
-      } else if (!isMedia && s.panic_mode !== 'local') {
-        const holdMs = s.panic_fade_ms + 800;
-        setTimeout(() => {
-          if (s.panic_mode === 'fade' || s.panic_mode === 'launch_app') {
-            closeOverlay();
-          } else if (s.panic_mode === 'combo' && !s.combo_modes.includes('youtube')) {
-            closeOverlay();
-          } else if (s.panic_mode === 'glitch') {
-            closeOverlay();
-          }
-        }, holdMs);
+        if (hardClose > 0) {
+          const exitTimer = window.setTimeout(
+              () => void closeOverlay(),
+              Math.max(0, hardClose - EXIT_MS),
+          );
+          timersRef.current.push(exitTimer);
+        }
+      } catch (error) {
+        console.error('[guiso] failed to initialize panic overlay', error);
+        // Still cover the screen even if the settings IPC call fails.
+        requestAnimationFrame(() => setStage('active'));
       }
     }
-    init();
-  }, [closeOverlay]);
+
+    void init();
+    return () => {
+      cancelled = true;
+      clearTimers();
+    };
+  }, [clearTimers, closeOverlay]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeOverlay();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void closeOverlay();
+      }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, [closeOverlay]);
 
-  if (!settings) return null;
+  const modes = useMemo(() => (settings ? activeModes(settings) : new Set<string>()), [settings]);
+  const youtubeVisible = Boolean(settings && modes.has('youtube') && settings.youtube_url.trim());
+  const localVisible = Boolean(settings && modes.has('local') && settings.local_video_path.trim());
+  const glitchVisible = Boolean(settings && modes.has('glitch') && screenshot);
+  const fadeVisible = modes.has('fade');
+  const localSrc = settings ? localVideoUrl(settings.local_video_path) : '';
+  const youtubeSrc = settings ? toEmbedUrl(settings.youtube_url) : '';
 
-  const modes = activeModes(settings);
-  const showYoutube =
-    modes.has('youtube') && settings.panic_target.trim() !== '';
-  const showGlitch = modes.has('glitch') && screenshot;
-  const showFade =
-    modes.has('fade') ||
-    settings.panic_mode === 'fade' ||
-    (settings.panic_mode === 'launch_app' && settings.combo_modes.length === 0);
-  const isLocal = settings.panic_mode === 'local';
-  const fadeMs = settings.panic_fade_ms;
+  if (!settings) {
+    return (
+        <div className="fixed inset-0 bg-black" aria-hidden="true" />
+    );
+  }
+
+  const background = settings.panic_color || 'rgba(15,15,15,0.97)';
 
   return (
-    <>
-      <style>{`
-        @keyframes glitch-anim {
-          0%   { clip-path: inset(20% 0 80% 0); transform: translate(-3px, 3px); }
-          25%  { clip-path: inset(60% 0 10% 0); transform: translate(3px, -3px); }
-          50%  { clip-path: inset(40% 0 50% 0); transform: translate(3px, 3px); }
-          75%  { clip-path: inset(80% 0 5% 0);  transform: translate(-3px, -3px); }
-          100% { clip-path: inset(30% 0 50% 0); transform: translate(-3px, 3px); }
+      <div
+          className={`fixed inset-0 overflow-hidden bg-black text-white ${
+              stage === 'enter'
+                  ? 'panic-overlay-enter'
+                  : stage === 'exit'
+                      ? 'panic-overlay-exit'
+                      : 'panic-overlay-active'
+          }`}
+          style={{
+            backgroundColor: background,
+            backdropFilter: `blur(${settings.panic_blur_px}px)`,
+            WebkitBackdropFilter: `blur(${settings.panic_blur_px}px)`,
+          }}
+          role="presentation"
+      >
+        <style>{`
+        @keyframes panic-in {
+          from { opacity: 0; transform: scale(1.012); }
+          to { opacity: 1; transform: scale(1); }
         }
-        .glitch-a { animation: glitch-anim 0.12s ease-in-out infinite; }
-        .glitch-b { animation: glitch-anim 0.2s ease-in-out reverse infinite; }
+        @keyframes panic-out {
+          from { opacity: 1; transform: scale(1); }
+          to { opacity: 0; transform: scale(1.01); }
+        }
+        @keyframes glitch-anim {
+          0%   { clip-path: inset(20% 0 80% 0); transform: translate(-4px, 2px); }
+          20%  { clip-path: inset(60% 0 10% 0); transform: translate(4px, -2px); }
+          40%  { clip-path: inset(40% 0 50% 0); transform: translate(2px, 3px); }
+          60%  { clip-path: inset(80% 0 5% 0); transform: translate(-3px, -1px); }
+          80%  { clip-path: inset(30% 0 50% 0); transform: translate(1px, 4px); }
+          100% { clip-path: inset(20% 0 80% 0); transform: translate(-4px, 2px); }
+        }
+        .panic-overlay-enter { animation: panic-in var(--panic-fade-ms) ease-out both; }
+        .panic-overlay-active { opacity: 1; }
+        .panic-overlay-exit { animation: panic-out ${EXIT_MS}ms ease-in both; pointer-events: none; }
+        .glitch-a { animation: glitch-anim 0.12s steps(2, end) infinite; }
+        .glitch-b { animation: glitch-anim 0.19s steps(2, end) reverse infinite; }
       `}</style>
 
-      <div
-        className={`relative w-screen h-screen overflow-hidden ${
-          stage === 'enter'
-            ? 'panic-overlay-enter opacity-0'
-            : stage === 'exit'
-              ? 'panic-overlay-exit'
-              : 'opacity-100'
-        }`}
-        style={
-          {
-            '--panic-fade-ms': `${fadeMs}ms`,
-            backgroundColor: isLocal ? '#000' : settings.panic_color,
-            backdropFilter: isLocal
-              ? 'none'
-              : `blur(${settings.panic_blur_px}px)`,
-            WebkitBackdropFilter: isLocal
-              ? 'none'
-              : `blur(${settings.panic_blur_px}px)`,
-          } as React.CSSProperties
-        }
-        onClick={!isLocal && !showYoutube ? closeOverlay : undefined}
-      >
-        {showGlitch && (
-          <div className="absolute inset-0">
-            <img
-              src={screenshot}
-              alt=""
-              className="absolute inset-0 w-full h-full object-cover grayscale contrast-[1.15] brightness-90"
+        <div
+            className="absolute inset-0"
+            style={{ '--panic-fade-ms': `${Math.max(0, settings.panic_fade_ms)}ms` } as CSSProperties}
+        />
+
+        {glitchVisible && (
+            <div className="absolute inset-0 z-10 overflow-hidden">
+              <img
+                  src={screenshot ?? ''}
+                  alt=""
+                  className="absolute inset-0 h-full w-full object-cover grayscale contrast-[1.15] brightness-90"
+              />
+              <img
+                  src={screenshot ?? ''}
+                  alt=""
+                  className="glitch-a absolute inset-0 h-full w-full object-cover opacity-65 mix-blend-screen"
+                  style={{ filter: 'hue-rotate(85deg) saturate(1.35)' }}
+              />
+              <img
+                  src={screenshot ?? ''}
+                  alt=""
+                  className="glitch-b absolute inset-0 h-full w-full object-cover opacity-60 mix-blend-screen"
+                  style={{ filter: 'hue-rotate(-85deg) saturate(1.35)' }}
+              />
+              <div className="absolute inset-0 bg-black/25" />
+            </div>
+        )}
+
+        {localVisible && !mediaError && (
+            <video
+                src={localSrc}
+                autoPlay
+                playsInline
+                loop
+                onError={() => setMediaError(true)}
+                onLoadedMetadata={(event) => {
+                  const start = Math.max(0, settings.local_video_start_time || 0);
+                  if (start < event.currentTarget.duration) {
+                    event.currentTarget.currentTime = start;
+                  }
+                  void event.currentTarget.play().catch(() => undefined);
+                }}
+                className="absolute inset-0 z-20 h-full w-full object-cover bg-black"
             />
-            <img
-              src={screenshot}
-              alt=""
-              className="glitch-a absolute inset-0 w-full h-full object-cover opacity-70 mix-blend-screen"
-              style={{ filter: 'hue-rotate(90deg)' }}
+        )}
+
+        {youtubeVisible && !mediaError && (
+            <iframe
+                src={youtubeSrc}
+                allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+                allowFullScreen
+                referrerPolicy="strict-origin-when-cross-origin"
+                className="absolute inset-0 z-20 h-full w-full border-0"
+                title="Disguise video"
             />
-            <img
-              src={screenshot}
-              alt=""
-              className="glitch-b absolute inset-0 w-full h-full object-cover opacity-70 mix-blend-screen translate-x-2"
-              style={{ filter: 'hue-rotate(-90deg)' }}
+        )}
+
+        {(fadeVisible || (!youtubeVisible && !localVisible && !glitchVisible)) && (
+            <div
+                className="absolute inset-0 z-15"
+                style={{ backgroundColor: background }}
             />
-            <div className="absolute inset-0 bg-black/20 pointer-events-none" />
-          </div>
         )}
 
-        {showYoutube && (
-          <iframe
-            src={toEmbedUrl(settings.panic_target)}
-            allow="autoplay; encrypted-media; fullscreen"
-            className="absolute inset-0 w-full h-full border-none z-10"
-            title="video"
-          />
+        {mediaError && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/90 px-8 text-center">
+              <div>
+                <div className="text-sm font-semibold text-white">Disguise media could not be played</div>
+                <div className="mt-1 text-xs text-white/50">The protective cover is still active.</div>
+              </div>
+            </div>
         )}
 
-        {isLocal && settings.local_video_path && (
-          <video
-            src={settings.local_video_path}
-            autoPlay
-            controls
-            onLoadedMetadata={(e) => {
-              e.currentTarget.currentTime =
-                settings.local_video_start_time || 0;
-            }}
-            className="absolute inset-0 w-full h-full object-contain z-10"
-          />
-        )}
-
-        {showFade && !showYoutube && !showGlitch && !isLocal && (
-          <div className="absolute inset-0" />
-        )}
-
-        {!isLocal && !showYoutube && (
-          <button
-            onClick={closeOverlay}
-            className="absolute top-4 right-4 z-50 w-8 h-8 flex items-center justify-center rounded-full bg-black/30 hover:bg-black/50 text-white/60 hover:text-white text-lg transition-all cursor-pointer backdrop-blur-sm border border-white/10"
-            aria-label="Close"
-          >
-            ×
-          </button>
-        )}
+        <button
+            type="button"
+            onClick={() => void closeOverlay()}
+            className="absolute right-5 top-5 z-50 flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-black/35 text-xl text-white/70 shadow-lg backdrop-blur-md transition hover:bg-black/60 hover:text-white focus:outline-none focus:ring-2 focus:ring-white/40"
+            aria-label="Close disguise"
+        >
+          ×
+        </button>
       </div>
-    </>
   );
 }

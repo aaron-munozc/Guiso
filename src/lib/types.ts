@@ -9,17 +9,27 @@ export interface ProcessInfo {
   cpu_usage: number;
   memory_mb: number;
   icon: string | null;
+  start_time: number;
+  killable: boolean;
+  protection_reason: string | null;
+  exe_path: string | null;
+}
+
+export interface QueuedProcess {
+  pid: number;
+  name: string;
+  start_time: number;
 }
 
 export type PanicMode =
-  | 'youtube'
-  | 'local'
-  | 'fade'
-  | 'glitch'
-  | 'launch_app'
-  | 'combo';
+    | 'youtube'
+    | 'local'
+    | 'fade'
+    | 'glitch'
+    | 'launch_app'
+    | 'combo';
 
-export type ComboMode = 'fade' | 'youtube' | 'glitch' | 'launch_app';
+export type ComboMode = 'fade' | 'youtube' | 'local' | 'glitch' | 'launch_app';
 
 export interface UserSettings {
   active_shortcut: string;
@@ -29,7 +39,10 @@ export interface UserSettings {
   panic_gesture: Point[];
 
   panic_mode: PanicMode;
+  /** Legacy field retained for config migration compatibility. */
   panic_target: string;
+  youtube_url: string;
+  launch_app_path: string;
   local_video_path: string;
   local_video_title: string;
   local_video_start_time: number;
@@ -45,17 +58,18 @@ export interface UserSettings {
 }
 
 export const PANIC_MODES: { id: PanicMode; label: string; desc: string }[] = [
-  { id: 'youtube', label: 'YouTube', desc: 'Fullscreen overlay playing a URL' },
-  { id: 'local', label: 'Local Video', desc: 'Windowed player for a file on disk' },
-  { id: 'fade', label: 'Color Fade', desc: 'Solid overlay that fades in' },
-  { id: 'glitch', label: 'Glitch', desc: 'Desktop screenshot with glitch effect' },
-  { id: 'launch_app', label: 'Launch App', desc: 'Spawn an app (overlay optional in combo)' },
-  { id: 'combo', label: 'Combo', desc: 'Mix multiple actions together' },
+  { id: 'youtube', label: 'YouTube', desc: 'Fullscreen web video disguise' },
+  { id: 'local', label: 'Local Video', desc: 'Fullscreen video from your disk' },
+  { id: 'fade', label: 'Color Fade', desc: 'Instant solid-color cover' },
+  { id: 'glitch', label: 'Glitch', desc: 'Pre-panic screenshot with interference' },
+  { id: 'launch_app', label: 'Launch App', desc: 'Start a configured program without an overlay' },
+  { id: 'combo', label: 'Combo', desc: 'Combine one media disguise with visual effects' },
 ];
 
-export const COMBO_OPTIONS: { id: ComboMode; label: string }[] = [
-  { id: 'fade', label: 'Color fade overlay' },
-  { id: 'youtube', label: 'YouTube embed' },
-  { id: 'glitch', label: 'Glitch screenshot' },
-  { id: 'launch_app', label: 'Launch application' },
+export const COMBO_OPTIONS: { id: ComboMode; label: string; desc: string }[] = [
+  { id: 'fade', label: 'Color fade', desc: 'Adds an opaque cover layer' },
+  { id: 'youtube', label: 'YouTube', desc: 'Use a web video as the disguise' },
+  { id: 'local', label: 'Local video', desc: 'Use a local file as the disguise' },
+  { id: 'glitch', label: 'Glitch', desc: 'Use the pre-panic desktop image' },
+  { id: 'launch_app', label: 'Launch app', desc: 'Start a companion application' },
 ];

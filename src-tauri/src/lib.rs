@@ -1,48 +1,34 @@
-//! Guiso – Panic-button Tauri backend
+//! Guiso – panic-button backend.
 //!
-//! A single `guiso_process()` function is the entry-point for every trigger
-//! (keyboard shortcut, mouse gesture, tray menu, frontend button).  It
-//! kills the configured processes first, then opens the overlay — so the
-//! desktop is already clean when the cover animation starts.
-//!
-//! ## Panic modes (`panic_mode` field)
-//! | value        | description                                                |
-//! |------------- |------------------------------------------------------------|
-//! | `youtube`    | Fullscreen overlay that plays a YouTube URL                |
-//! | `local`      | Windowed player for a file on the user's disk              |
-//! | `fade`       | Solid-colour overlay that fades in (no video)             |
-//! | `glitch`     | Screenshots the desktop first, then covers it with a fade  |
-//! | `launch_app` | Silently spawns an exe/script – no overlay shown           |
-//! | `combo`      | Mix of the above; the list lives in `combo_modes`         |
-//!
-//! ## Mouse-gesture trigger
-//! Middle-click (default), right-click, or left-click — configurable via
-//! `gesture_button`.  Draw the gesture while holding the button; release to
-//! evaluate.  The threshold (`gesture_threshold`) is the maximum allowed
-//! average per-point error; 0.0 = exact match, 1.0 = anything matches.
+//! The panic path is deliberately centralized: every trigger reaches
+//! `guiso_process()`, which snapshots the current settings, protects against
+//! re-entry, captures a disguise screenshot when requested, terminates the
+//! configured targets, optionally launches a companion app, and finally opens
+//! the disguise overlay.
 
 use app_info::get_file_icon;
 use base64::{engine::general_purpose, Engine as _};
 use image::{ImageBuffer, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_store::{StoreBuilder, StoreExt};
 use xcap::Monitor;
 
-// ─── Gesture Mathematics ($1 Unistroke Recogniser) ───────────────────────────
+// ─── Gesture mathematics ──────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -52,97 +38,260 @@ fn distance(a: &Point, b: &Point) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
 }
 
-fn path_length(pts: &[Point]) -> f64 {
-    pts.windows(2).map(|w| distance(&w[0], &w[1])).sum()
+fn path_length(points: &[Point]) -> f64 {
+    points.windows(2).map(|w| distance(&w[0], &w[1])).sum()
 }
 
+/// Resample a stroke into exactly `n` equally spaced points.
+///
+/// The old implementation could loop forever for zero-length strokes because
+/// its interval became zero. This version explicitly handles that case and
+/// never mutates the source vector while iterating.
 fn resample(points: &[Point], n: usize) -> Vec<Point> {
-    if points.len() < 2 {
-        return points.to_vec();
+    if n == 0 || points.is_empty() {
+        return Vec::new();
     }
-    let mut resampled = vec![points[0]];
-    let mut pts       = points.to_vec();
-    let mut acc       = 0.0_f64;
-    let interval      = path_length(&pts) / (n - 1) as f64;
-    let mut i         = 1;
+    if n == 1 {
+        return vec![points[0]];
+    }
+    if points.len() == 1 {
+        return vec![points[0]; n];
+    }
 
-    while i < pts.len() {
-        let d = distance(&pts[i - 1], &pts[i]);
-        if acc + d >= interval {
-            let t  = (interval - acc) / d;
-            let q  = Point {
-                x: pts[i - 1].x + t * (pts[i].x - pts[i - 1].x),
-                y: pts[i - 1].y + t * (pts[i].y - pts[i - 1].y),
+    let total = path_length(points);
+    if !total.is_finite() || total <= f64::EPSILON {
+        return vec![points[0]; n];
+    }
+
+    let interval = total / (n - 1) as f64;
+    let mut out = Vec::with_capacity(n);
+    out.push(points[0]);
+
+    let mut accumulated = 0.0;
+    let mut previous = points[0];
+    let mut i = 1usize;
+
+    while i < points.len() && out.len() < n {
+        let current = points[i];
+        let segment = distance(&previous, &current);
+
+        if segment <= f64::EPSILON {
+            previous = current;
+            i += 1;
+            continue;
+        }
+
+        if accumulated + segment >= interval {
+            let t = ((interval - accumulated) / segment).clamp(0.0, 1.0);
+            let q = Point {
+                x: previous.x + t * (current.x - previous.x),
+                y: previous.y + t * (current.y - previous.y),
             };
-            resampled.push(q);
-            pts.insert(i, q);
-            acc = 0.0;
+            out.push(q);
+            previous = q;
+            accumulated = 0.0;
         } else {
-            acc += d;
-            i   += 1;
+            accumulated += segment;
+            previous = current;
+            i += 1;
         }
     }
-    while resampled.len() < n {
-        resampled.push(*points.last().unwrap());
+
+    while out.len() < n {
+        out.push(*points.last().unwrap_or(&points[0]));
     }
-    resampled.truncate(n);
-    resampled
+    out.truncate(n);
+    out
 }
 
+/// Scale uniformly, preserve the gesture's aspect ratio, and center it around
+/// its centroid. Uniform scaling is much less distortion-prone than separately
+/// stretching x and y into a 0..1 box.
 fn normalize(points: &[Point]) -> Vec<Point> {
     if points.is_empty() {
-        return vec![];
+        return Vec::new();
     }
+
     let mut pts = resample(points, 64);
-    let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
-    let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
-    for p in &pts {
-        min_x = min_x.min(p.x);
-        max_x = max_x.max(p.x);
-        min_y = min_y.min(p.y);
-        max_y = max_y.max(p.y);
+    if pts.is_empty() {
+        return pts;
     }
-    let w = f64::max(max_x - min_x, 1.0);
-    let h = f64::max(max_y - min_y, 1.0);
-    for p in &mut pts {
-        p.x = (p.x - min_x) / w;
-        p.y = (p.y - min_y) / h;
+
+    let min_x = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let max_x = pts.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+    let min_y = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let max_y = pts.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+    let scale = (max_x - min_x).max(max_y - min_y).max(1.0);
+
+    let cx = pts.iter().map(|p| p.x).sum::<f64>() / pts.len() as f64;
+    let cy = pts.iter().map(|p| p.y).sum::<f64>() / pts.len() as f64;
+
+    for point in &mut pts {
+        point.x = (point.x - cx) / scale;
+        point.y = (point.y - cy) / scale;
     }
     pts
 }
 
-/// Average per-point distance between two equal-length paths.
-/// Lower = more similar.  Returns `f64::MAX` on empty / mismatched slices.
 fn match_gesture(drawn: &[Point], template: &[Point]) -> f64 {
     if drawn.len() != template.len() || template.is_empty() {
         return f64::MAX;
     }
-    drawn.iter()
-         .zip(template.iter())
-         .map(|(a, b)| distance(a, b))
-         .sum::<f64>()
+
+    drawn
+        .iter()
+        .zip(template.iter())
+        .map(|(a, b)| distance(a, b))
+        .sum::<f64>()
         / drawn.len() as f64
 }
 
-fn gesture_button_from_str(s: &str) -> rdev::Button {
-    match s {
-        "left"  => rdev::Button::Left,
+fn gesture_button_from_str(value: &str) -> rdev::Button {
+    match value {
+        "left" => rdev::Button::Left,
         "right" => rdev::Button::Right,
-        _       => rdev::Button::Middle, // safe default; middle is unambiguous
+        _ => rdev::Button::Middle,
     }
 }
 
-/// Whether panic should open a webview overlay (as opposed to only killing / launching).
-fn needs_overlay(settings: &UserSettings) -> bool {
-    match settings.panic_mode.as_str() {
-        "launch_app" => false,
-        "local" | "youtube" | "fade" | "glitch" => true,
-        "combo" => settings
-            .combo_modes
-            .iter()
-            .any(|m| m != "launch_app"),
-        _ => true,
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct UserSettings {
+    // Trigger
+    pub active_shortcut: String,
+    pub gesture_enabled: bool,
+    pub gesture_button: String,
+    pub gesture_threshold: f64,
+    pub panic_gesture: Vec<Point>,
+
+    // Disguise/action
+    pub panic_mode: String,
+    /// Legacy shared target. Kept for backwards-compatible config migration.
+    pub panic_target: String,
+    /// Separate target for YouTube disguise URLs.
+    pub youtube_url: String,
+    /// Separate target for companion executables/scripts.
+    pub launch_app_path: String,
+    pub local_video_path: String,
+    pub local_video_title: String,
+    pub local_video_start_time: u32,
+    pub panic_fade_ms: u64,
+    pub panic_color: String,
+    pub panic_blur_px: u32,
+    pub panic_auto_close_ms: u64,
+    pub panic_hotkey_close: bool,
+    pub combo_modes: Vec<String>,
+
+    // Process targets
+    pub saved_kill_processes: Vec<String>,
+
+    // UI
+    pub theme: String,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            active_shortcut: "CmdOrCtrl+Shift+K".into(),
+            gesture_enabled: false,
+            gesture_button: "middle".into(),
+            gesture_threshold: 0.20,
+            panic_gesture: Vec::new(),
+
+            panic_mode: "youtube".into(),
+            panic_target: String::new(),
+            youtube_url: String::new(),
+            launch_app_path: String::new(),
+            local_video_path: String::new(),
+            local_video_title: "Video Player".into(),
+            local_video_start_time: 0,
+            panic_fade_ms: 600,
+            panic_color: "rgba(15, 15, 15, 0.97)".into(),
+            panic_blur_px: 20,
+            panic_auto_close_ms: 0,
+            panic_hotkey_close: true,
+            combo_modes: Vec::new(),
+
+            saved_kill_processes: Vec::new(),
+            theme: "dark".into(),
+        }
     }
+}
+
+fn is_youtube_like(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("https://youtube.com/")
+        || value.starts_with("https://www.youtube.com/")
+        || value.starts_with("https://youtu.be/")
+}
+
+fn sanitize_settings(mut settings: UserSettings) -> UserSettings {
+    if !matches!(settings.gesture_button.as_str(), "left" | "right" | "middle") {
+        settings.gesture_button = "middle".into();
+    }
+    settings.gesture_threshold = settings.gesture_threshold.clamp(0.05, 0.50);
+    settings.panic_fade_ms = settings.panic_fade_ms.clamp(0, 5_000);
+    settings.panic_blur_px = settings.panic_blur_px.clamp(0, 80);
+    settings.local_video_title = if settings.local_video_title.trim().is_empty() {
+        "Video Player".into()
+    } else {
+        settings.local_video_title.trim().to_string()
+    };
+
+    // Migrate the old shared panic_target into the new dedicated field when
+    // possible. This keeps existing installations working after the upgrade.
+    if is_youtube_like(&settings.panic_target) && settings.youtube_url.trim().is_empty() {
+        settings.youtube_url = settings.panic_target.trim().to_string();
+    } else if !is_youtube_like(&settings.panic_target)
+        && settings.launch_app_path.trim().is_empty()
+        && !settings.panic_target.trim().is_empty()
+    {
+        settings.launch_app_path = settings.panic_target.trim().to_string();
+    }
+
+    settings.panic_mode = match settings.panic_mode.as_str() {
+        "youtube" | "local" | "fade" | "glitch" | "launch_app" | "combo" => {
+            settings.panic_mode
+        }
+        _ => "fade".into(),
+    };
+
+    let allowed: HashSet<&str> = ["fade", "youtube", "local", "glitch", "launch_app"]
+        .into_iter()
+        .collect();
+    let mut combo = Vec::new();
+    for mode in settings.combo_modes.drain(..) {
+        if allowed.contains(mode.as_str()) && !combo.contains(&mode) {
+            combo.push(mode);
+        }
+    }
+    // Only one primary media disguise can own the visible playback surface.
+    // Keeping both would result in one element hiding the other.
+    let media = combo
+        .iter()
+        .position(|m| m == "youtube" || m == "local");
+    if let Some(media_index) = media {
+        let media_mode = combo[media_index].clone();
+        combo.retain(|m| m != "youtube" && m != "local");
+        combo.insert(0, media_mode);
+    }
+    settings.combo_modes = combo;
+
+    settings.saved_kill_processes = settings
+        .saved_kill_processes
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .fold(Vec::<String>::new(), |mut out, name| {
+            if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&name)) {
+                out.push(name);
+            }
+            out
+        });
+
+    settings
 }
 
 fn persist_settings(app: &AppHandle, settings: &UserSettings) -> Result<(), String> {
@@ -151,236 +300,344 @@ fn persist_settings(app: &AppHandle, settings: &UserSettings) -> Result<(), Stri
     store.save().map_err(|e| e.to_string())
 }
 
-/// Spawn a companion executable without flashing a console window on Windows.
-fn spawn_panic_app(target: &str) {
-    if target.is_empty() {
-        return;
+// ─── Process management ──────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub memory_mb: u64,
+    pub icon: Option<String>,
+    pub start_time: u64,
+    pub killable: bool,
+    pub protection_reason: Option<String>,
+    pub exe_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QueuedProcess {
+    pub pid: u32,
+    pub name: String,
+    pub start_time: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct KillStats {
+    attempted: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+fn own_process_name() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+        .map(|name| name.to_ascii_lowercase())
+}
+
+fn protection_reason(name: &str, pid: u32) -> Option<String> {
+    let lower = name.trim().to_ascii_lowercase();
+    if own_process_name().as_deref() == Some(lower.as_str()) {
+        return Some("Guiso is protected from terminating itself".into());
     }
+
+    // Conservative cross-platform deny-list for processes that are commonly
+    // essential to the OS/session. Users can still target ordinary apps.
+    let protected = [
+        "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+        "services.exe", "lsass.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe",
+        "system idle process", "launchd", "init", "systemd", "kthreadd", "kernel_task",
+    ];
+    if protected.iter().any(|candidate| candidate.eq_ignore_ascii_case(&lower)) {
+        return Some("Protected OS process".into());
+    }
+
+    #[cfg(unix)]
+    if pid <= 1 {
+        return Some("Protected system PID".into());
+    }
+
+    None
+}
+
+fn system_with_processes() -> System {
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys
+}
+
+fn kill_queued_processes(targets: &[QueuedProcess]) -> KillStats {
+    if targets.is_empty() {
+        return KillStats::default();
+    }
+
+    let sys = system_with_processes();
+    let mut stats = KillStats::default();
+
+    for target in targets {
+        stats.attempted += 1;
+        let process = sys.process(Pid::from(target.pid as usize));
+        let Some(process) = process else {
+            stats.failed += 1;
+            continue;
+        };
+
+        let current_name = process.name().to_string_lossy();
+        if !current_name.eq_ignore_ascii_case(&target.name)
+            || (target.start_time != 0 && process.start_time() != target.start_time)
+        {
+            // PID was reused or no longer points to the original process.
+            stats.failed += 1;
+            continue;
+        }
+        if protection_reason(&current_name, target.pid).is_some() {
+            stats.failed += 1;
+            continue;
+        }
+
+        if process.kill() {
+            stats.succeeded += 1;
+        } else {
+            stats.failed += 1;
+        }
+    }
+
+    stats
+}
+
+fn kill_named_processes(names: &[String]) -> KillStats {
+    if names.is_empty() {
+        return KillStats::default();
+    }
+
+    let targets: HashSet<String> = names
+        .iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let sys = system_with_processes();
+    let mut stats = KillStats::default();
+
+    for (pid, process) in sys.processes() {
+        let name = process.name().to_string_lossy().to_string();
+        if !targets.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        if protection_reason(&name, pid.as_u32()).is_some() {
+            continue;
+        }
+
+        stats.attempted += 1;
+        if process.kill() {
+            stats.succeeded += 1;
+        } else {
+            stats.failed += 1;
+        }
+    }
+
+    stats
+}
+
+fn spawn_panic_app(target: &str) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Ok(());
+    }
+
+    let path = PathBuf::from(target);
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = Command::new(target)
+
+        let mut command = if matches!(extension.as_str(), "bat" | "cmd") {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.args(["/C", target]);
+            cmd
+        } else {
+            Command::new(target)
+        };
+
+        command
             .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Could not launch '{target}': {e}"))
     }
 
     #[cfg(not(windows))]
     {
-        let _ = Command::new(target).spawn();
+        Command::new(target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Could not launch '{target}': {e}"))
     }
 }
 
-// ─── Data Structures ──────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct ProcessInfo {
-    pid:       u32,
-    name:      String,
-    cpu_usage: f32,
-    memory_mb: u64,
-    icon:      Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct UserSettings {
-    // ── Trigger ────────────────────────────────────────────────────────────────
-    pub active_shortcut:   String,
-    pub gesture_enabled:   bool,
-    /// "middle" | "right" | "left"  (left interferes with normal clicking)
-    pub gesture_button:    String,
-    /// 0.0–1.0; lower = stricter.  Recommended: 0.15–0.25
-    pub gesture_threshold: f64,
-    pub panic_gesture:     Vec<Point>,
-
-    // ── Visual overlay ─────────────────────────────────────────────────────────
-    pub panic_mode:           String,
-    /// YouTube URL (youtube mode) or executable path (launch_app mode)
-    pub panic_target:         String,
-    /// Absolute path to the video file shown in "local" mode
-    pub local_video_path:     String,
-    pub local_video_title:    String,
-    /// Seconds into the local video to start playback
-    pub local_video_start_time: u32,
-    /// Duration of the CSS fade-in animation (milliseconds); read by the frontend
-    pub panic_fade_ms:        u64,
-    /// CSS colour for the overlay backdrop  e.g. "rgba(10,10,10,0.97)"
-    pub panic_color:          String,
-    pub panic_blur_px:        u32,
-    /// 0 = stay open until dismissed; >0 = auto-close after N ms
-    pub panic_auto_close_ms:  u64,
-    /// Pressing the panic shortcut a second time closes the overlay
-    pub panic_hotkey_close:   bool,
-    /// Sub-mode list when `panic_mode == "combo"` e.g. ["fade", "youtube"]
-    pub combo_modes:          Vec<String>,
-
-    // ── Kill list (persistent) ─────────────────────────────────────────────────
-    /// Process names (case-insensitive substring) killed on every panic trigger.
-    /// Stored by name so they survive restarts (PIDs change between sessions).
-    pub saved_kill_processes: Vec<String>,
-
-    // ── UI ─────────────────────────────────────────────────────────────────────
-    pub theme: String,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            active_shortcut:      "CmdOrCtrl+Shift+K".to_string(),
-            gesture_enabled:      false,
-            gesture_button:       "middle".to_string(),
-            gesture_threshold:    0.20,
-            panic_gesture:        vec![],
-
-            panic_mode:           "youtube".to_string(),
-            panic_target:         String::new(),
-            local_video_path:     String::new(),
-            local_video_title:    "Video Player".to_string(),
-            local_video_start_time: 0,
-            panic_fade_ms:        600,
-            panic_color:          "rgba(15, 15, 15, 0.97)".to_string(),
-            panic_blur_px:        20,
-            panic_auto_close_ms:  0,
-            panic_hotkey_close:   true,
-            combo_modes:          vec![],
-
-            saved_kill_processes: vec![],
-            theme:                "dark".to_string(),
-        }
-    }
-}
+// ─── App state ───────────────────────────────────────────────────────────────
 
 struct AppState {
     icon_cache: Mutex<HashMap<String, String>>,
-    /// Session-only PID queue; merged with `saved_kill_processes` at panic time.
-    /// Not persisted — PIDs are ephemeral.
-    runtime_kill_pids: Mutex<Vec<u32>>,
-    settings:         Mutex<UserSettings>,
-    last_screenshot:  Mutex<Option<String>>,
-    /// True while the panic overlay window is alive.
-    panic_active:     Mutex<bool>,
+    runtime_kill_pids: Mutex<Vec<QueuedProcess>>,
+    settings: Mutex<UserSettings>,
+    last_screenshot: Mutex<Option<String>>,
+    panic_active: Mutex<bool>,
+    panic_generation: Mutex<u64>,
 }
 
-// ─── Internal Kill Helpers ────────────────────────────────────────────────────
-
-fn kill_process_by_pid(pid: u32) -> Result<(), String> {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
-    );
-    sys.refresh_processes(ProcessesToUpdate::All, false);
-    sys.process(Pid::from(pid as usize))
-       .ok_or_else(|| format!("PID {pid} not found"))
-       .and_then(|p| {
-           if p.kill() { Ok(()) }
-           else        { Err(format!("No permission to kill PID {pid}")) }
-       })
-}
-
-/// Kills every process whose name exactly matches any of `names` (case-insensitive).
-fn kill_processes_by_name(names: &[String]) {
-    if names.is_empty() { return; }
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
-    );
-    sys.refresh_processes(ProcessesToUpdate::All, false);
-    for (_, proc) in sys.processes() {
-        let pname = proc.name().to_string_lossy().to_lowercase();
-        if names.iter().any(|n| pname == n.to_lowercase()) {
-            proc.kill();
-        }
+fn needs_overlay(settings: &UserSettings) -> bool {
+    match settings.panic_mode.as_str() {
+        "launch_app" => false,
+        "combo" => settings.combo_modes.iter().any(|m| m != "launch_app"),
+        _ => true,
     }
 }
 
-// ─── Process Commands ─────────────────────────────────────────────────────────
+fn wants_mode(settings: &UserSettings, mode: &str) -> bool {
+    if settings.panic_mode == mode {
+        return true;
+    }
+    settings.panic_mode == "combo" && settings.combo_modes.iter().any(|m| m == mode)
+}
 
-/// Returns all running processes with icons, CPU, and memory.
-/// Icons are cached by exe path to avoid repeated disk reads.
+fn overlay_is_present(app: &AppHandle) -> bool {
+    app.get_webview_window("panic_overlay").is_some()
+}
+
+// ─── Tauri commands ──────────────────────────────────────────────────────────
+
 #[tauri::command]
 fn get_processes(state: tauri::State<'_, AppState>) -> Vec<ProcessInfo> {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-    );
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-
+    let sys = system_with_processes();
     let mut cache = state.icon_cache.lock().unwrap();
-    let mut out   = Vec::with_capacity(sys.processes().len());
+    let mut out = Vec::with_capacity(sys.processes().len());
 
-    for (pid, proc) in sys.processes() {
-        let exe = proc.exe()
-                      .map(|p| p.to_string_lossy().into_owned())
-                      .unwrap_or_default();
-
+    for (pid, process) in sys.processes() {
+        let exe = process
+            .exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let icon = if exe.is_empty() {
             None
         } else if let Some(hit) = cache.get(&exe) {
             Some(hit.clone())
         } else {
-            // Fetch a 32 px icon — small enough to not bloat IPC payloads
-            get_file_icon(&exe, 32).ok().and_then(|raw| {
+            let value = get_file_icon(&exe, 32).ok().and_then(|raw| {
                 let img = ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-                    raw.width, raw.height, raw.pixels,
+                    raw.width,
+                    raw.height,
+                    raw.pixels,
                 )?;
                 let mut buf = Cursor::new(Vec::new());
-                RgbaImage::from(img).write_to(&mut buf, ImageFormat::Png).ok()?;
-                let url = format!(
-                    "data:image/png;base64,{}",
-                    general_purpose::STANDARD.encode(buf.into_inner())
-                );
+                RgbaImage::from(img)
+                    .write_to(&mut buf, ImageFormat::Png)
+                    .ok()?;
+                let encoded = general_purpose::STANDARD.encode(buf.into_inner());
+                let url = format!("data:image/png;base64,{encoded}");
                 cache.insert(exe.clone(), url.clone());
                 Some(url)
-            })
+            });
+            value
         };
 
+        let name = process.name().to_string_lossy().into_owned();
+        let protection = protection_reason(&name, pid.as_u32());
         out.push(ProcessInfo {
-            pid:       pid.as_u32(),
-            name:      proc.name().to_string_lossy().into_owned(),
-            cpu_usage: proc.cpu_usage(),
-            memory_mb: proc.memory() / 1_048_576,
+            pid: pid.as_u32(),
+            name,
+            cpu_usage: process.cpu_usage(),
+            memory_mb: process.memory() / 1_048_576,
             icon,
+            start_time: process.start_time(),
+            killable: protection.is_none(),
+            protection_reason: protection,
+            exe_path: if exe.is_empty() { None } else { Some(exe) },
         });
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by(|a, b| {
+        a.name
+         .to_ascii_lowercase()
+         .cmp(&b.name.to_ascii_lowercase())
+         .then(a.pid.cmp(&b.pid))
+    });
     out
 }
 
-/// Add a PID to the session-only kill queue.
 #[tauri::command]
 fn add_pid(pid: u32, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let mut q = state.runtime_kill_pids.lock().unwrap();
-    if !q.contains(&pid) { q.push(pid); }
-    Ok("PID queued.".to_string())
+    let sys = system_with_processes();
+    let process = sys
+        .process(Pid::from(pid as usize))
+        .ok_or_else(|| format!("PID {pid} is no longer running"))?;
+    let name = process.name().to_string_lossy().into_owned();
+
+    if let Some(reason) = protection_reason(&name, pid) {
+        return Err(reason);
+    }
+
+    let target = QueuedProcess {
+        pid,
+        name,
+        start_time: process.start_time(),
+    };
+    let mut queue = state.runtime_kill_pids.lock().unwrap();
+    if !queue.iter().any(|item| item.pid == pid) {
+        queue.push(target);
+    }
+    Ok("Process queued.".into())
 }
 
-/// Remove a PID from the session-only kill queue.
 #[tauri::command]
 fn remove_pid(pid: u32, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    state.runtime_kill_pids.lock().unwrap().retain(|&x| x != pid);
-    Ok("PID removed.".to_string())
+    state
+        .runtime_kill_pids
+        .lock()
+        .unwrap()
+        .retain(|item| item.pid != pid);
+    Ok("Process removed from the session queue.".into())
 }
 
-/// Return the current session-only PID queue so the frontend can display it.
 #[tauri::command]
-fn get_queued_pids(state: tauri::State<'_, AppState>) -> Vec<u32> {
+fn get_queued_pids(state: tauri::State<'_, AppState>) -> Vec<QueuedProcess> {
     state.runtime_kill_pids.lock().unwrap().clone()
 }
 
-/// Persist a list of process names so they are killed on every future panic.
-/// The frontend sends the names after the user selects them in the process picker.
 #[tauri::command]
 fn save_kill_list(
     app: tauri::AppHandle,
     names: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let mut s = state.settings.lock().unwrap();
-    s.saved_kill_processes = names;
-    persist_settings(&app, &s)?;
-    Ok("Kill list saved.".to_string())
-}
+    let cleaned = names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .fold(Vec::<String>::new(), |mut out, name| {
+            if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&name)) {
+                out.push(name);
+            }
+            out
+        });
 
-// ─── Settings Commands ────────────────────────────────────────────────────────
+    let snapshot = {
+        let mut settings = state.settings.lock().unwrap();
+        settings.saved_kill_processes = cleaned;
+        settings.clone()
+    };
+    persist_settings(&app, &snapshot)?;
+    Ok("Kill list saved.".into())
+}
 
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> UserSettings {
@@ -393,203 +650,263 @@ fn update_settings(
     new_settings: UserSettings,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let mut lock = state.settings.lock().unwrap();
+    let sanitized = sanitize_settings(new_settings);
+    let old_shortcut = state.settings.lock().unwrap().active_shortcut.clone();
 
-    // Hot-swap the global shortcut only when it actually changed
-    if lock.active_shortcut != new_settings.active_shortcut {
-        let old = Shortcut::from_str(&lock.active_shortcut)
-            .map_err(|e| format!("Bad old shortcut: {e}"))?;
-        let new_sc = Shortcut::from_str(&new_settings.active_shortcut)
-            .map_err(|e| format!("Invalid shortcut '{}': {e}", new_settings.active_shortcut))?;
+    if old_shortcut != sanitized.active_shortcut {
+        let new_shortcut = Shortcut::from_str(&sanitized.active_shortcut)
+            .map_err(|e| format!("Invalid shortcut '{}': {e}", sanitized.active_shortcut))?;
 
         app.global_shortcut()
-           .unregister(old)
-           .map_err(|e| e.to_string())?;
-        app.global_shortcut()
-           .on_shortcut(new_sc, |h, _, ev| {
-               if ev.state == ShortcutState::Pressed { guiso_process(h.clone()); }
+           .on_shortcut(new_shortcut, |handle, _, event| {
+               if event.state == ShortcutState::Pressed {
+                   guiso_process(handle.clone());
+               }
            })
-           .map_err(|e| e.to_string())?;
+           .map_err(|e| format!("Could not register new shortcut: {e}"))?;
+
+        if let Ok(old) = Shortcut::from_str(&old_shortcut) {
+            if let Err(error) = app.global_shortcut().unregister(old) {
+                eprintln!("[guiso] warning: old shortcut unregister failed: {error}");
+            }
+        }
     }
 
-    *lock = new_settings.clone();
-    persist_settings(&app, &new_settings)?;
-    Ok("Settings saved.".to_string())
+    {
+        *state.settings.lock().unwrap() = sanitized.clone();
+    }
+    persist_settings(&app, &sanitized)?;
+    Ok("Settings saved.".into())
 }
 
-/// Normalise and persist a drawn gesture path.
 #[tauri::command]
 fn save_gesture(
     app: tauri::AppHandle,
     raw_points: Vec<Point>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let normalised = normalize(&raw_points);
-    let mut lock   = state.settings.lock().unwrap();
-    lock.panic_gesture = normalised;
-    persist_settings(&app, &lock)?;
-    Ok("Gesture saved.".to_string())
+    if raw_points.len() < 6 || path_length(&raw_points) <= f64::EPSILON {
+        return Err("Draw a longer gesture before saving it.".into());
+    }
+
+    let normalized = normalize(&raw_points);
+    let snapshot = {
+        let mut settings = state.settings.lock().unwrap();
+        settings.panic_gesture = normalized;
+        settings.clone()
+    };
+    persist_settings(&app, &snapshot)?;
+    Ok("Gesture saved.".into())
 }
 
-// ─── Panic Commands ───────────────────────────────────────────────────────────
-
-/// Returns the base64 PNG of the last captured desktop screenshot (glitch mode).
 #[tauri::command]
 fn get_last_screenshot(state: tauri::State<'_, AppState>) -> Option<String> {
     state.last_screenshot.lock().unwrap().clone()
 }
 
-/// Trigger panic manually from the frontend (e.g. a test button or keyboard shortcut in the UI).
 #[tauri::command]
 fn trigger_panic(app: tauri::AppHandle) {
     guiso_process(app);
 }
 
-/// Close the panic overlay from the overlay UI itself (e.g. an ESC key binding).
 #[tauri::command]
 fn close_panic(app: tauri::AppHandle, state: tauri::State<'_, AppState>) {
-    if let Some(w) = app.get_webview_window("panic_overlay") {
-        let _ = w.close();
+    if let Some(window) = app.get_webview_window("panic_overlay") {
+        let _ = window.close();
     }
     *state.panic_active.lock().unwrap() = false;
+    let mut generation = state.panic_generation.lock().unwrap();
+    *generation = generation.wrapping_add(1);
 }
 
-/// Whether the panic overlay is currently visible.  Lets the frontend style itself.
 #[tauri::command]
 fn is_panic_active(state: tauri::State<'_, AppState>) -> bool {
     *state.panic_active.lock().unwrap()
 }
 
-/// Evaluate a drawn path against the saved template and return the score.
-/// Useful for a "test gesture" button in settings: lower = better match.
 #[tauri::command]
 fn test_gesture_score(raw_points: Vec<Point>, state: tauri::State<'_, AppState>) -> f64 {
     let settings = state.settings.lock().unwrap();
-    if settings.panic_gesture.is_empty() || raw_points.len() < 5 {
+    if settings.panic_gesture.is_empty() || raw_points.len() < 6 {
         return f64::MAX;
     }
     match_gesture(&normalize(&raw_points), &settings.panic_gesture)
 }
 
-// ─── Core Panic Logic ─────────────────────────────────────────────────────────
+// ─── Screenshot / overlay ─────────────────────────────────────────────────────
 
 fn take_screenshot(app: &AppHandle) {
-    if let Ok(monitors) = Monitor::all() {
-        if let Some(mon) = monitors.first() {
-            if let Ok(img) = mon.capture_image() {
-                let mut buf = Cursor::new(Vec::new());
-                if img.write_to(&mut buf, ImageFormat::Png).is_ok() {
-                    let b64 = general_purpose::STANDARD.encode(buf.into_inner());
-                    *app.state::<AppState>().last_screenshot.lock().unwrap() =
-                        Some(format!("data:image/png;base64,{b64}"));
-                }
-            }
-        }
+    let Some(mon) = Monitor::all().ok().and_then(|monitors| monitors.into_iter().next()) else {
+        *app.state::<AppState>().last_screenshot.lock().unwrap() = None;
+        return;
+    };
+
+    let Ok(image) = mon.capture_image() else {
+        *app.state::<AppState>().last_screenshot.lock().unwrap() = None;
+        return;
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    if image.write_to(&mut buf, ImageFormat::Png).is_ok() {
+        let b64 = general_purpose::STANDARD.encode(buf.into_inner());
+        *app.state::<AppState>().last_screenshot.lock().unwrap() =
+            Some(format!("data:image/png;base64,{b64}"));
+    } else {
+        *app.state::<AppState>().last_screenshot.lock().unwrap() = None;
     }
 }
 
-/// Central panic handler.  Called from every trigger source.
-fn guiso_process(app: AppHandle) {
-    let state    = app.state::<AppState>();
-    let settings = state.settings.lock().unwrap().clone();
+fn build_overlay(app: &AppHandle, settings: &UserSettings) -> Result<(), String> {
+    let title = if wants_mode(settings, "local") {
+        if settings.local_video_title.trim().is_empty() {
+            "System Process".into()
+        } else {
+            settings.local_video_title.clone()
+        }
+    } else {
+        "System Process".into()
+    };
 
-    // ── Toggle: close overlay if it is already open ───────────────────────────
-    if app.get_webview_window("panic_overlay").is_some() {
+    WebviewWindowBuilder::new(
+        app,
+        "panic_overlay",
+        WebviewUrl::App("/panic".into()),
+    )
+        .title(&title)
+        .decorations(false)
+        .fullscreen(true)
+        .always_on_top(true)
+        .transparent(false)
+        .skip_taskbar(true)
+        .resizable(false)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn schedule_overlay_close(app: &AppHandle, generation: u64, delay_ms: u64) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        let state = handle.state::<AppState>();
+
+        // Never hold both mutexes at once. Every panic lifecycle path follows
+        // the same acquire/release discipline to avoid lock-order deadlocks.
+        let current_generation = *state.panic_generation.lock().unwrap();
+        if current_generation != generation {
+            return;
+        }
+        if !*state.panic_active.lock().unwrap() {
+            return;
+        }
+
+        if let Some(window) = handle.get_webview_window("panic_overlay") {
+            let _ = window.close();
+        }
+        *state.panic_active.lock().unwrap() = false;
+    });
+}
+
+/// One canonical panic path for the keyboard shortcut, gesture, tray and UI.
+fn guiso_process(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = sanitize_settings(state.settings.lock().unwrap().clone());
+
+    // Re-entry is a deliberate toggle only when the user enabled it. Otherwise
+    // a repeated signal is ignored instead of killing/relaunching everything.
+    if overlay_is_present(&app) || *state.panic_active.lock().unwrap() {
         if settings.panic_hotkey_close {
-            if let Some(w) = app.get_webview_window("panic_overlay") {
-                let _ = w.close();
-            }
-            *state.panic_active.lock().unwrap() = false;
+            close_panic(app, state);
         }
         return;
     }
 
-    // ── Screenshot (glitch mode or combo containing glitch) ───────────────────
-    let wants_glitch = settings.panic_mode == "glitch"
-        || settings.combo_modes.contains(&"glitch".to_string());
+    if !needs_overlay(&settings) && settings.panic_mode == "launch_app"
+        && settings.launch_app_path.trim().is_empty()
+    {
+        eprintln!("[guiso] launch_app mode selected but no application path is configured");
+    }
+
+    // Claim the panic before doing any work so two triggers cannot overlap.
+    {
+        let mut active = state.panic_active.lock().unwrap();
+        if *active {
+            return;
+        }
+        *active = true;
+    }
+    let generation = {
+        let mut generation = state.panic_generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        *generation
+    };
+
+    let wants_glitch = wants_mode(&settings, "glitch");
     if wants_glitch {
-        // Capture before killing so the screenshot is still "innocent"
+        // Capture first so the screenshot reflects the pre-panic desktop.
         take_screenshot(&app);
     }
 
-    // ── Kill session-only PID queue ───────────────────────────────────────────
-    {
-        let pids: Vec<u32> = state.runtime_kill_pids.lock().unwrap().clone();
-        for pid in &pids { let _ = kill_process_by_pid(*pid); }
-        state.runtime_kill_pids.lock().unwrap().clear();
+    let queued_targets = {
+        let mut queue = state.runtime_kill_pids.lock().unwrap();
+        let snapshot = queue.clone();
+        queue.clear();
+        snapshot
+    };
+    let session_stats = kill_queued_processes(&queued_targets);
+    let saved_stats = kill_named_processes(&settings.saved_kill_processes);
+
+    if session_stats.failed > 0 || saved_stats.failed > 0 {
+        eprintln!(
+            "[guiso] process cleanup: session {}/{} succeeded, {} failed; named {}/{} succeeded, {} failed",
+            session_stats.succeeded,
+            session_stats.attempted,
+            session_stats.failed,
+            saved_stats.succeeded,
+            saved_stats.attempted,
+            saved_stats.failed
+        );
     }
 
-    // ── Kill persistent named processes ───────────────────────────────────────
-    kill_processes_by_name(&settings.saved_kill_processes);
-
-    // ── Silently launch a companion app if configured ─────────────────────────
-    let wants_launch = (settings.panic_mode == "launch_app"
-        || settings.combo_modes.contains(&"launch_app".to_string()))
-        && !settings.panic_target.is_empty();
-    if wants_launch {
-        spawn_panic_app(&settings.panic_target);
+    if wants_mode(&settings, "launch_app") && !settings.launch_app_path.trim().is_empty() {
+        if let Err(error) = spawn_panic_app(&settings.launch_app_path) {
+            eprintln!("[guiso] {error}");
+        }
     }
 
     if !needs_overlay(&settings) {
+        *state.panic_active.lock().unwrap() = false;
         return;
     }
 
-    // ── Build the overlay window ──────────────────────────────────────────────
-    // "local" mode: decorated, resizable window (the user controls it).
-    // Everything else: transparent, fullscreen, always-on-top overlay.
-    let is_local = settings.panic_mode == "local";
-    let build_result = if is_local {
-        let mut builder = WebviewWindowBuilder::new(&app, "panic_overlay", WebviewUrl::App("/panic".into()))
-            .title(&settings.local_video_title)
-            .decorations(true)
-            .fullscreen(false)
-            .inner_size(960.0, 540.0)
-            .always_on_top(true)
-            .transparent(false)
-            .skip_taskbar(false);
-        if let Ok(monitors) = app.available_monitors() {
-            if let Some(monitor) = monitors.into_iter().next() {
-                let size = monitor.size();
-                let pos = monitor.position();
-                builder = builder.position(
-                    pos.x as f64 + (size.width as f64 - 960.0) / 2.0,
-                    pos.y as f64 + (size.height as f64 - 540.0) / 2.0,
-                );
-            }
-        }
-        builder.build()
+    // Build only after cleanup. A failed build must release the active latch so
+    // the next trigger can still recover.
+    if let Err(error) = build_overlay(&app, &settings) {
+        eprintln!("[guiso] failed to build panic overlay: {error}");
+        *state.panic_active.lock().unwrap() = false;
+        return;
+    }
+
+    // The explicit timer is a hard safety net. The frontend starts the visual
+    // exit slightly before this deadline when possible. A zero setting means
+    // persistent for media disguises and a sensible transient lifetime for
+    // fade/glitch-only disguises.
+    let hard_close_ms = if settings.panic_auto_close_ms > 0 {
+        // Give the frontend enough time to run its exit animation before the
+        // backend's hard safety close.
+        settings.panic_auto_close_ms.saturating_add(450)
+    } else if wants_mode(&settings, "youtube") || wants_mode(&settings, "local") {
+        0
     } else {
-        WebviewWindowBuilder::new(&app, "panic_overlay", WebviewUrl::App("/panic".into()))
-            .title("System Process")
-            .decorations(false)
-            .fullscreen(true)
-            .always_on_top(true)
-            .transparent(true)
-            .skip_taskbar(true)
-            .build()
+        settings.panic_fade_ms.saturating_add(1_400)
     };
 
-    if build_result.is_ok() {
-        *state.panic_active.lock().unwrap() = true;
-
-        // ── Auto-close timer ──────────────────────────────────────────────────
-        if settings.panic_auto_close_ms > 0 {
-            let app_c = app.clone();
-            let ms    = settings.panic_auto_close_ms;
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(ms));
-                if let Some(w) = app_c.get_webview_window("panic_overlay") {
-                    let _ = w.close();
-                }
-                *app_c.state::<AppState>().panic_active.lock().unwrap() = false;
-            });
-        }
-    } else if let Err(e) = build_result {
-        eprintln!("[guiso] Failed to build panic overlay: {e}");
+    if hard_close_ms > 0 {
+        schedule_overlay_close(&app, generation, hard_close_ms);
     }
 }
 
-// ─── App Entry Point ──────────────────────────────────────────────────────────
+// ─── Application startup ──────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -600,71 +917,73 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
-            icon_cache:        Mutex::new(HashMap::new()),
+            icon_cache: Mutex::new(HashMap::new()),
             runtime_kill_pids: Mutex::new(Vec::new()),
-            settings:          Mutex::new(UserSettings::default()),
-            last_screenshot:   Mutex::new(None),
-            panic_active:      Mutex::new(false),
+            settings: Mutex::new(UserSettings::default()),
+            last_screenshot: Mutex::new(None),
+            panic_active: Mutex::new(false),
+            panic_generation: Mutex::new(0),
         })
         .setup(|app| {
-            // ── Load persisted settings ───────────────────────────────────────
             let store = StoreBuilder::new(app, "settings.json")
                 .default("config", json!(UserSettings::default()))
                 .build()?;
 
-            let saved: UserSettings = match store.get("config") {
-                Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
-                None    => UserSettings::default(),
+            let loaded: UserSettings = match store.get("config") {
+                Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
+                None => UserSettings::default(),
             };
+            let saved = sanitize_settings(loaded);
             *app.state::<AppState>().settings.lock().unwrap() = saved.clone();
 
-            // ── Register global shortcut ──────────────────────────────────────
-            match Shortcut::from_str(&saved.active_shortcut) {
-                Ok(sc) => {
-                    app.global_shortcut()
-                       .on_shortcut(sc, |h, _, ev| {
-                           if ev.state == ShortcutState::Pressed { guiso_process(h.clone()); }
-                       })
-                       .unwrap_or_else(|e| {
-                           eprintln!("[guiso] Could not register shortcut: {e}");
-                       });
-                }
-                Err(e) => {
-                    eprintln!("[guiso] Invalid saved shortcut '{}': {e}", saved.active_shortcut);
-                }
+            // Persist migrated/sanitized settings immediately so old configs do
+            // not re-enter the application in an invalid state.
+            if let Err(error) = persist_settings(app.handle(), &saved) {
+                eprintln!("[guiso] warning: could not persist normalized settings: {error}");
             }
 
-            // ── System tray ───────────────────────────────────────────────────
-            let item_show  = MenuItem::with_id(app, "show",  "Open Settings",    true, None::<&str>)?;
-            let item_panic = MenuItem::with_id(app, "panic", "⚡ Trigger Panic", true, None::<&str>)?;
-            let item_quit  = MenuItem::with_id(app, "quit",  "Quit",             true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&item_show, &item_panic, &item_quit])?;
+            if let Ok(shortcut) = Shortcut::from_str(&saved.active_shortcut) {
+                if let Err(error) = app.global_shortcut().on_shortcut(shortcut, |handle, _, event| {
+                    if event.state == ShortcutState::Pressed {
+                        guiso_process(handle.clone());
+                    }
+                }) {
+                    eprintln!("[guiso] could not register shortcut: {error}");
+                }
+            } else {
+                eprintln!("[guiso] invalid saved shortcut '{}'; use Settings to fix it", saved.active_shortcut);
+            }
+
+            let show = MenuItem::with_id(app, "show", "Open Settings", true, None::<&str>)?;
+            let panic = MenuItem::with_id(app, "panic", "⚡ Trigger Panic", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &panic, &quit])?;
 
             let mut tray = TrayIconBuilder::new()
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, ev| match ev.id.as_ref() {
-                    "quit"  => app.exit(0),
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
                     "panic" => guiso_process(app.clone()),
-                    "show"  => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
                     }
                     _ => {}
                 })
-                .on_tray_icon_event(|tray, ev| {
+                .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } = ev
+                    } = event
                     {
                         let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
                     }
                 });
@@ -674,120 +993,114 @@ pub fn run() {
             }
             tray.build(app)?;
 
-            // ── Mouse-gesture listener (dedicated OS-level thread) ────────────
-            //
-            // rdev::listen is a blocking call that must run on its own thread.
-            // We read settings from the state only on button-press events
-            // (not on every MouseMove) to minimise lock contention.
-            let app_h = app.handle().clone();
+            // OS-level mouse gesture listener. We only record after the chosen
+            // trigger button is pressed and only end a gesture when that exact
+            // button is released. This prevents unrelated clicks from aborting
+            // the recognition state.
+            let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                let recording:   Arc<Mutex<bool>>       = Arc::new(Mutex::new(false));
-                let gesture_pts: Arc<Mutex<Vec<Point>>> = Arc::new(Mutex::new(Vec::new()));
-                let rec2 = recording.clone();
-                let pts2 = gesture_pts.clone();
+                struct GestureState {
+                    button: Option<rdev::Button>,
+                    points: Vec<Point>,
+                }
 
-                if let Err(e) = rdev::listen(move |ev| {
-                    match ev.event_type {
-                        // ─ Start recording when the configured trigger is pressed
-                        rdev::EventType::ButtonPress(btn) => {
-                            let settings = app_h.state::<AppState>()
-                                                .settings.lock().unwrap().clone();
-                            if !settings.gesture_enabled { return; }
-                            if btn == gesture_button_from_str(&settings.gesture_button) {
-                                *rec2.lock().unwrap() = true;
-                                pts2.lock().unwrap().clear();
+                let state = Arc::new(Mutex::new(GestureState {
+                    button: None,
+                    points: Vec::new(),
+                }));
+                let state_cb = state.clone();
+
+                if let Err(error) = rdev::listen(move |event| match event.event_type {
+                    rdev::EventType::ButtonPress(button) => {
+                        let settings = app_handle
+                            .state::<AppState>()
+                            .settings
+                            .lock()
+                            .unwrap()
+                            .clone();
+                        if !settings.gesture_enabled
+                            || button != gesture_button_from_str(&settings.gesture_button)
+                        {
+                            return;
+                        }
+                        let mut recording = state_cb.lock().unwrap();
+                        recording.button = Some(button);
+                        recording.points.clear();
+                    }
+                    rdev::EventType::MouseMove { x, y } => {
+                        let mut recording = state_cb.lock().unwrap();
+                        if recording.button.is_some() {
+                            let point = Point { x, y };
+                            if recording
+                                .points
+                                .last()
+                                .map(|last| distance(last, &point) >= 1.0)
+                                .unwrap_or(true)
+                            {
+                                recording.points.push(point);
                             }
                         }
-                        // ─ Accumulate path while recording
-                        rdev::EventType::MouseMove { x, y } => {
-                            if *rec2.lock().unwrap() {
-                                pts2.lock().unwrap().push(Point { x, y });
-                            }
-                        }
-                        // ─ Any button release ends the gesture attempt
-                        rdev::EventType::ButtonRelease(btn) => {
-                            // Atomically flip recording off and take the points
-                            let was_recording = {
-                                let mut r = rec2.lock().unwrap();
-                                let v = *r;
-                                *r = false;
-                                v
-                            };
-                            if !was_recording { return; }
-
-                            let settings = app_h.state::<AppState>()
-                                                .settings.lock().unwrap().clone();
-                            if btn != gesture_button_from_str(&settings.gesture_button) {
-                                pts2.lock().unwrap().clear();
+                    }
+                    rdev::EventType::ButtonRelease(button) => {
+                        let points = {
+                            let mut recording = state_cb.lock().unwrap();
+                            if recording.button != Some(button) {
                                 return;
                             }
+                            recording.button = None;
+                            std::mem::take(&mut recording.points)
+                        };
 
-                            let points: Vec<Point> = {
-                                let mut lock = pts2.lock().unwrap();
-                                let pts = lock.clone();
-                                lock.clear();
-                                pts
-                            };
-
-                            // Need at least 10 points to be a meaningful stroke
-                            if points.len() <= 10 { return; }
-
-                            if settings.panic_gesture.is_empty() { return; }
-
-                            let score = match_gesture(
-                                &normalize(&points),
-                                &settings.panic_gesture,
-                            );
-                            if score < settings.gesture_threshold {
-                                guiso_process(app_h.clone());
-                            }
+                        if points.len() < 8 || path_length(&points) < 20.0 {
+                            return;
                         }
-                        _ => {}
+
+                        let settings = app_handle
+                            .state::<AppState>()
+                            .settings
+                            .lock()
+                            .unwrap()
+                            .clone();
+                        if !settings.gesture_enabled || settings.panic_gesture.is_empty() {
+                            return;
+                        }
+
+                        let score = match_gesture(&normalize(&points), &settings.panic_gesture);
+                        if score <= settings.gesture_threshold {
+                            guiso_process(app_handle.clone());
+                        }
                     }
+                    _ => {}
                 }) {
-                    eprintln!("[guiso] rdev listener error: {e:?}");
+                    eprintln!("[guiso] rdev listener error: {error:?}");
                 }
             });
 
             Ok(())
         })
-        // ── Window lifecycle events ───────────────────────────────────────────
-        .on_window_event(|window, event| {
-            match event {
-                // Main window: hide to tray instead of quitting
-                tauri::WindowEvent::CloseRequested { api, .. }
-                if window.label() == "main" =>
-                    {
-                        let _ = window.hide();
-                        api.prevent_close();
-                    }
-                // Panic overlay: reset the active flag whenever the window is gone
-                // (handles close(), force-kill, and the auto-close timer equally)
-                tauri::WindowEvent::Destroyed
-                if window.label() == "panic_overlay" =>
-                    {
-                        *window.app_handle()
-                               .state::<AppState>()
-                               .panic_active
-                               .lock()
-                               .unwrap() = false;
-                    }
-                _ => {}
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                let _ = window.hide();
+                api.prevent_close();
             }
+            tauri::WindowEvent::Destroyed if window.label() == "panic_overlay" => {
+                let state = window.app_handle().state::<AppState>();
+                *state.panic_active.lock().unwrap() = false;
+                let mut generation = state.panic_generation.lock().unwrap();
+                *generation = generation.wrapping_add(1);
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            // ── Process management ────────────────────────────────────────────
             get_processes,
             add_pid,
             remove_pid,
             get_queued_pids,
             save_kill_list,
-            // ── Settings ──────────────────────────────────────────────────────
             get_settings,
             update_settings,
             save_gesture,
             test_gesture_score,
-            // ── Panic ─────────────────────────────────────────────────────────
             trigger_panic,
             close_panic,
             is_panic_active,

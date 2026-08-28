@@ -1,4 +1,5 @@
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { createFileRoute } from '@tanstack/react-router';
@@ -8,6 +9,7 @@ import {
   PANIC_MODES,
   type ComboMode,
   type ProcessInfo,
+  type QueuedProcess,
   type UserSettings,
 } from '../lib/types';
 
@@ -17,108 +19,199 @@ export const Route = createFileRoute('/')({
 
 type Tab = 'targets' | 'action' | 'triggers' | 'appearance';
 
+const TAB_META: { id: Tab; label: string; icon: string; help: string }[] = [
+  { id: 'targets', label: 'Kill Targets', icon: '◎', help: 'Choose exactly which processes panic should terminate.' },
+  { id: 'action', label: 'Panic Action', icon: '⚡', help: 'Choose the screen disguise and optional companion app.' },
+  { id: 'triggers', label: 'Triggers', icon: '⌨', help: 'Configure the global shortcut and emergency gesture.' },
+  { id: 'appearance', label: 'Appearance', icon: '◐', help: 'Tune the cover color, blur, animation and timeout.' },
+];
+
 function RouteComponent() {
   const [tab, setTab] = useState<Tab>('targets');
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [search, setSearch] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [sessionPids, setSessionPids] = useState<number[]>([]);
+  const [sessionTargets, setSessionTargets] = useState<QueuedProcess[]>([]);
   const [settings, setSettings] = useState<UserSettings | null>(null);
+  const [loadedSnapshot, setLoadedSnapshot] = useState<string>('');
   const [toast, setToast] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isTestingPanic, setIsTestingPanic] = useState(false);
-
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const pointsRef = useRef<{ x: number; y: number }[]>([]);
-  const [gestureScore, setGestureScore] = useState<number | null>(null);
-
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false);
+  const [gestureScore, setGestureScore] = useState<number | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [gesturePoints, setGesturePoints] = useState<{ x: number; y: number }[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pointsRef = useRef<{ x: number; y: number }[]>([]);
+  const toastTimerRef = useRef<number | null>(null);
 
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 2800);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
 
-  const fetchProcesses = async () => {
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
+
+  const settingsFingerprint = useCallback((value: UserSettings) => JSON.stringify(value), []);
+
+  const fetchProcesses = useCallback(async () => {
     setIsRefreshing(true);
     try {
       const list = await invoke<ProcessInfo[]>('get_processes');
       setProcesses(list);
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error('[guiso] process scan failed', error);
+      showToast('Could not refresh the process list');
     } finally {
       setIsRefreshing(false);
     }
-  };
+  }, [showToast]);
+
+  const load = useCallback(async () => {
+    try {
+      const [loaded, queued] = await Promise.all([
+        invoke<UserSettings>('get_settings'),
+        invoke<QueuedProcess[]>('get_queued_pids'),
+      ]);
+      setSettings(loaded);
+      setLoadedSnapshot(settingsFingerprint(loaded));
+      setSessionTargets(queued);
+      await fetchProcesses();
+    } catch (error) {
+      console.error('[guiso] settings load failed', error);
+      showToast('Could not load Guiso settings');
+    }
+  }, [fetchProcesses, settingsFingerprint, showToast]);
 
   useEffect(() => {
-    invoke<UserSettings>('get_settings').then(setSettings);
-    invoke<number[]>('get_queued_pids').then(setSessionPids);
-    fetchProcesses();
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (!document.hidden) void fetchProcesses();
+    }, 7000);
+    return () => window.clearInterval(interval);
+  }, [fetchProcesses]);
+
+  const update = useCallback((patch: Partial<UserSettings>) => {
+    setSettings((current) => (current ? { ...current, ...patch } : current));
   }, []);
+
+  const dirty = Boolean(settings && settingsFingerprint(settings) !== loadedSnapshot);
 
   useEffect(() => {
     if (!isRecordingShortcut) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      e.preventDefault();
-      if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
-      const keys: string[] = [];
-      if (e.ctrlKey || e.metaKey) keys.push('CmdOrCtrl');
-      if (e.altKey) keys.push('Alt');
-      if (e.shiftKey) keys.push('Shift');
-      let keyName = e.key.toUpperCase();
-      if (keyName === ' ') keyName = 'SPACE';
-      keys.push(keyName);
-      setSettings((s) => (s ? { ...s, active_shortcut: keys.join('+') } : null));
+
+    const keyMap: Record<string, string> = {
+      ' ': 'SPACE',
+      Escape: 'Esc',
+      Enter: 'Enter',
+      Tab: 'Tab',
+      Backspace: 'Backspace',
+      Delete: 'Delete',
+      Insert: 'Insert',
+      Home: 'Home',
+      End: 'End',
+      PageUp: 'PageUp',
+      PageDown: 'PageDown',
+      ArrowUp: 'Up',
+      ArrowDown: 'Down',
+      ArrowLeft: 'Left',
+      ArrowRight: 'Right',
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return;
+
+      const parts: string[] = [];
+      if (event.ctrlKey || event.metaKey) parts.push('CmdOrCtrl');
+      if (event.altKey) parts.push('Alt');
+      if (event.shiftKey) parts.push('Shift');
+
+      const key = keyMap[event.key] ?? (event.key.length === 1 ? event.key.toUpperCase() : event.key);
+      parts.push(key);
+      update({ active_shortcut: parts.join('+') });
       setIsRecordingShortcut(false);
     };
+
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isRecordingShortcut]);
+  }, [isRecordingShortcut, update]);
 
-  const handleMinimizeToTray = () => getCurrentWebviewWindow().hide();
+  const handleMinimizeToTray = useCallback(async () => {
+    try {
+      await getCurrentWebviewWindow().hide();
+    } catch (error) {
+      console.error('[guiso] could not hide to tray', error);
+    }
+  }, []);
 
-  const toggleSessionPid = async (pid: number) => {
-    if (sessionPids.includes(pid)) {
-      await invoke('remove_pid', { pid });
-      setSessionPids((p) => p.filter((id) => id !== pid));
-    } else {
-      await invoke('add_pid', { pid });
-      setSessionPids((p) => [...p, pid]);
+  const toggleSessionTarget = async (process: ProcessInfo) => {
+    if (!process.killable) {
+      showToast(process.protection_reason ?? 'This process is protected');
+      return;
+    }
+
+    const queued = sessionTargets.some((item) => item.pid === process.pid);
+    try {
+      if (queued) {
+        await invoke('remove_pid', { pid: process.pid });
+        setSessionTargets((items) => items.filter((item) => item.pid !== process.pid));
+      } else {
+        await invoke('add_pid', { pid: process.pid });
+        setSessionTargets((items) => [
+          ...items.filter((item) => item.pid !== process.pid),
+          {
+            pid: process.pid,
+            name: process.name,
+            start_time: process.start_time,
+          },
+        ]);
+      }
+    } catch (error) {
+      console.error('[guiso] session target update failed', error);
+      showToast(String(error));
     }
   };
 
   const toggleSavedName = (name: string) => {
     if (!settings) return;
-    const lower = name.toLowerCase();
+    const normalized = name.trim();
+    if (!normalized) return;
     const exists = settings.saved_kill_processes.some(
-      (n) => n.toLowerCase() === lower,
+        (item) => item.toLowerCase() === normalized.toLowerCase(),
     );
-    setSettings({
-      ...settings,
+    update({
       saved_kill_processes: exists
-        ? settings.saved_kill_processes.filter(
-            (n) => n.toLowerCase() !== lower,
+          ? settings.saved_kill_processes.filter(
+              (item) => item.toLowerCase() !== normalized.toLowerCase(),
           )
-        : [...settings.saved_kill_processes, name],
+          : [...settings.saved_kill_processes, normalized],
     });
   };
 
   const isNameSaved = (name: string) =>
-    settings?.saved_kill_processes.some(
-      (n) => n.toLowerCase() === name.toLowerCase(),
-    ) ?? false;
+      settings?.saved_kill_processes.some(
+          (item) => item.toLowerCase() === name.toLowerCase(),
+      ) ?? false;
 
   const saveSettings = async () => {
     if (!settings) return;
     setIsSaving(true);
     try {
       await invoke('update_settings', { newSettings: settings });
-      showToast('Settings saved');
-    } catch (e) {
-      showToast('Failed to save settings');
-      console.error(e);
+      setLoadedSnapshot(settingsFingerprint(settings));
+      showToast('Settings saved and trigger re-armed');
+    } catch (error) {
+      console.error('[guiso] settings save failed', error);
+      showToast(`Could not save settings: ${String(error)}`);
     } finally {
       setIsSaving(false);
     }
@@ -128,757 +221,602 @@ function RouteComponent() {
     if (!settings) return;
     try {
       await invoke('save_kill_list', { names: settings.saved_kill_processes });
-      showToast('Kill list persisted');
-    } catch (e) {
-      showToast('Failed to save kill list');
-      console.error(e);
+      setLoadedSnapshot(settingsFingerprint(settings));
+      showToast('Persistent kill list saved');
+    } catch (error) {
+      console.error('[guiso] kill list save failed', error);
+      showToast(`Could not save kill list: ${String(error)}`);
     }
   };
 
   const testPanic = async () => {
+    if (!settings) return;
+    const confirmed = window.confirm(
+        'This runs the real panic path. Configured process targets will be terminated. Continue?',
+    );
+    if (!confirmed) return;
+
     setIsTestingPanic(true);
     try {
       await invoke('trigger_panic');
+    } catch (error) {
+      console.error('[guiso] panic test failed', error);
+      showToast(`Panic trigger failed: ${String(error)}`);
     } finally {
-      setTimeout(() => setIsTestingPanic(false), 1200);
+      window.setTimeout(() => setIsTestingPanic(false), 1400);
     }
   };
 
-  const startDrawing = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    setIsDrawing(true);
+  const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((event.clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const drawCanvasStroke = (points: { x: number; y: number }[]) => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#d97706';
+    if (points.length === 0) return;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+    ctx.stroke();
+  };
+
+  const startDrawing = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const point = canvasPoint(event);
+    if (!point) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointsRef.current = [point];
+    setGesturePoints([point]);
     setGestureScore(null);
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    pointsRef.current = [{ x: e.clientX - rect.left, y: e.clientY - rect.top }];
-    const ctx = canvasRef.current?.getContext('2d');
-    if (ctx) {
-      ctx.clearRect(0, 0, rect.width, rect.height);
-      ctx.beginPath();
-      ctx.moveTo(e.clientX - rect.left, e.clientY - rect.top);
-    }
+    setIsDrawing(true);
+    drawCanvasStroke([point]);
   };
 
-  const draw = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const continueDrawing = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!isDrawing) return;
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    pointsRef.current.push({ x, y });
-    const ctx = canvasRef.current?.getContext('2d');
-    if (ctx) {
-      ctx.lineTo(x, y);
-      ctx.strokeStyle = '#d97706';
-      ctx.lineWidth = 3;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.stroke();
-    }
+    const point = canvasPoint(event);
+    if (!point) return;
+    const last = pointsRef.current[pointsRef.current.length - 1];
+    if (last && Math.hypot(point.x - last.x, point.y - last.y) < 1) return;
+    pointsRef.current.push(point);
+    setGesturePoints(pointsRef.current.slice());
+    drawCanvasStroke(pointsRef.current);
   };
 
-  const finishDrawing = async () => {
+  const finishDrawing = async (event?: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!isDrawing) return;
     setIsDrawing(false);
-    if (pointsRef.current.length <= 5) return;
-    await invoke('save_gesture', { rawPoints: pointsRef.current });
-    const score = await invoke<number>('test_gesture_score', {
-      rawPoints: pointsRef.current,
-    });
-    setGestureScore(score);
-    showToast('Gesture saved');
+    if (event && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    const points = pointsRef.current.slice();
+    if (points.length < 8) {
+      showToast('Gesture is too short — draw a more distinct stroke');
+      return;
+    }
+
+    try {
+      await invoke('save_gesture', { rawPoints: points });
+      const score = await invoke<number>('test_gesture_score', { rawPoints: points });
+      setGestureScore(score);
+      showToast('Gesture saved');
+    } catch (error) {
+      console.error('[guiso] gesture save failed', error);
+      showToast(`Could not save gesture: ${String(error)}`);
+    }
+  };
+
+  const clearGesturePreview = () => {
+    pointsRef.current = [];
+    setGesturePoints([]);
+    setGestureScore(null);
+    drawCanvasStroke([]);
   };
 
   const toggleComboMode = (mode: ComboMode) => {
     if (!settings) return;
     const has = settings.combo_modes.includes(mode);
-    setSettings({
-      ...settings,
-      combo_modes: has
-        ? settings.combo_modes.filter((m) => m !== mode)
-        : [...settings.combo_modes, mode],
-    });
+    let combo = has
+        ? settings.combo_modes.filter((item) => item !== mode)
+        : [...settings.combo_modes, mode];
+
+    if (!has && (mode === 'youtube' || mode === 'local')) {
+      combo = combo.filter((item) => item !== 'youtube' && item !== 'local');
+      combo.unshift(mode);
+    }
+    update({ combo_modes: combo });
   };
 
-  const filtered = processes.filter((p) =>
-    p.name.toLowerCase().includes(search.toLowerCase()),
-  );
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return processes;
+    return processes.filter((process) => {
+      return (
+          process.name.toLowerCase().includes(query) ||
+          process.exe_path?.toLowerCase().includes(query)
+      );
+    });
+  }, [processes, search]);
 
   const savedCount = settings?.saved_kill_processes.length ?? 0;
-  const sessionCount = sessionPids.length;
+  const sessionCount = sessionTargets.length;
   const color = settings ? parseRgba(settings.panic_color) : null;
+  const selectedMode = settings
+      ? PANIC_MODES.find((mode) => mode.id === settings.panic_mode)
+      : null;
+  const mediaMode = settings?.panic_mode === 'combo'
+      ? settings.combo_modes.find((mode) => mode === 'youtube' || mode === 'local')
+      : settings?.panic_mode === 'youtube' || settings?.panic_mode === 'local'
+          ? settings.panic_mode
+          : undefined;
 
-  const tabs: { id: Tab; label: string; icon: string }[] = [
-    { id: 'targets', label: 'Kill Targets', icon: '◎' },
-    { id: 'action', label: 'Panic Action', icon: '⚡' },
-    { id: 'triggers', label: 'Triggers', icon: '⌨' },
-    { id: 'appearance', label: 'Appearance', icon: '◐' },
-  ];
-
-  if (!settings) {
+  if (!settings || !color) {
     return (
-      <div className="h-screen flex items-center justify-center bg-[#0a0908] text-stone-400 text-sm">
-        Loading…
-      </div>
+        <div className="h-screen flex items-center justify-center bg-[#090807] text-stone-400 text-sm">
+          Loading Guiso…
+        </div>
     );
   }
 
   return (
-    <div className="h-screen flex bg-[#0a0908] text-stone-200 overflow-hidden select-none">
-      {/* Sidebar */}
-      <aside className="w-56 shrink-0 flex flex-col border-r border-[#2a2622] bg-[#0f0e0c]">
-        <div
-          data-tauri-drag-region
-          className="px-5 pt-6 pb-5 border-b border-[#2a2622]/60"
-        >
-          <div className="flex items-center gap-3">
-            <img
-              src="/logo_dark.svg"
-              alt="Guiso"
-              className="w-9 h-9 rounded-lg"
-              draggable={false}
-            />
-            <div>
-              <h1 className="text-base font-bold tracking-tight text-stone-50">
-                Guiso
-              </h1>
-              <p className="text-[10px] text-stone-500 font-medium uppercase tracking-widest">
-                Panic Button
-              </p>
+      <div className="h-screen flex bg-[#090807] text-stone-200 overflow-hidden select-none">
+        <aside className="w-62.5 shrink-0 flex flex-col border-r border-guiso-border bg-[#0f0e0c]">
+          <div data-tauri-drag-region className="px-5 pt-6 pb-5 border-b border-guiso-border/70">
+            <div className="flex items-center gap-3">
+              <img src="/logo_dark.svg" alt="Guiso" className="w-10 h-10 rounded-xl" draggable={false} />
+              <div className="min-w-0">
+                <h1 className="text-base font-bold tracking-tight text-stone-50">Guiso</h1>
+                <p className="text-[10px] text-stone-500 font-semibold uppercase tracking-[0.18em]">Panic Button</p>
+              </div>
+            </div>
+            <div className="mt-5 flex items-center gap-2 rounded-xl border border-emerald-500/15 bg-emerald-500/5 px-3 py-2">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.55)]" />
+              <span className="text-[11px] font-semibold text-emerald-300">ARMED</span>
+              <span className="ml-auto text-[10px] text-stone-600">ready</span>
             </div>
           </div>
-        </div>
 
-        <nav className="flex-1 p-3 space-y-1">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all cursor-pointer ${
-                tab === t.id
-                  ? 'bg-amber-600/15 text-amber-400 border border-amber-600/25'
-                  : 'text-stone-400 hover:text-stone-200 hover:bg-[#1c1917] border border-transparent'
-              }`}
-            >
-              <span className="text-base opacity-70">{t.icon}</span>
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="p-4 border-t border-[#2a2622]/60 space-y-2">
-          <div className="px-3 py-2 rounded-lg bg-[#141210] border border-[#2a2622] text-[11px] space-y-1">
-            <div className="flex justify-between text-stone-500">
-              <span>Shortcut</span>
-              <span className="font-mono text-amber-500/80 text-[10px]">
-                {settings.active_shortcut}
-              </span>
-            </div>
-            <div className="flex justify-between text-stone-500">
-              <span>Targets</span>
-              <span className="text-stone-300">
-                {savedCount} saved · {sessionCount} session
-              </span>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top bar */}
-        <header
-          data-tauri-drag-region
-          className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[#2a2622]/60 bg-[#0a0908]/80"
-        >
-          <div>
-            <h2 className="text-lg font-semibold text-stone-50">
-              {tabs.find((t) => t.id === tab)?.label}
-            </h2>
-            <p className="text-xs text-stone-500 mt-0.5">
-              {tab === 'targets' &&
-                'Select processes to close when panic is triggered'}
-              {tab === 'action' &&
-                'Choose what happens after processes are killed'}
-              {tab === 'triggers' &&
-                'Configure keyboard shortcut and mouse gesture'}
-              {tab === 'appearance' &&
-                'Customize overlay visuals and timing'}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={testPanic}
-              disabled={isTestingPanic}
-              className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-amber-600/20 border border-amber-600/40 text-amber-400 hover:bg-amber-600/30 transition-all cursor-pointer disabled:opacity-50 animate-pulse-ring"
-            >
-              {isTestingPanic ? 'Triggered…' : 'Test Panic'}
-            </button>
-            <button
-              onClick={handleMinimizeToTray}
-              className="px-3.5 py-2 text-xs font-medium rounded-lg bg-[#1c1917] border border-[#2a2622] text-stone-400 hover:text-stone-200 hover:border-stone-600 transition-all cursor-pointer"
-            >
-              Hide to Tray
-            </button>
-          </div>
-        </header>
-
-        {/* Content */}
-        <main className="flex-1 overflow-y-auto custom-scrollbar p-6 animate-fade-in-up">
-          {/* ── Kill Targets ── */}
-          {tab === 'targets' && (
-            <div className="space-y-4 max-w-4xl">
-              <div className="flex gap-3">
-                <input
-                  type="text"
-                  placeholder="Search running processes…"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="flex-1 px-4 py-2.5 bg-[#141210] border border-[#2a2622] rounded-lg text-sm text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-600/50 focus:ring-1 focus:ring-amber-600/30 select-text"
-                />
+          <nav className="flex-1 p-3 space-y-1">
+            {TAB_META.map((item) => (
                 <button
-                  onClick={fetchProcesses}
-                  disabled={isRefreshing}
-                  className="px-4 py-2.5 text-sm font-medium rounded-lg bg-[#1c1917] border border-[#2a2622] hover:border-stone-600 transition-all cursor-pointer disabled:opacity-50"
-                >
-                  {isRefreshing ? 'Scanning…' : 'Refresh'}
-                </button>
-              </div>
-
-              {settings.saved_kill_processes.length > 0 && (
-                <div className="p-4 rounded-xl bg-[#141210] border border-[#2a2622]">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
-                      Saved targets (persistent)
-                    </span>
-                    <button
-                      onClick={saveKillList}
-                      className="text-[11px] font-medium text-amber-500 hover:text-amber-400 cursor-pointer"
-                    >
-                      Persist to disk
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {settings.saved_kill_processes.map((name) => (
-                      <span
-                        key={name}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10 border border-red-500/25 text-red-300 text-xs font-medium"
-                      >
-                        {name}
-                        <button
-                          onClick={() => toggleSavedName(name)}
-                          className="opacity-60 hover:opacity-100 cursor-pointer"
-                        >
-                          ×
-                        </button>
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div className="rounded-xl border border-[#2a2622] overflow-hidden bg-[#141210]">
-                <div className="max-h-[calc(100vh-280px)] overflow-y-auto custom-scrollbar">
-                  {filtered.length === 0 ? (
-                    <p className="p-8 text-center text-stone-500 text-sm">
-                      No matching processes
-                    </p>
-                  ) : (
-                    filtered.map((proc) => {
-                      const inSession = sessionPids.includes(proc.pid);
-                      const saved = isNameSaved(proc.name);
-                      return (
-                        <div
-                          key={proc.pid}
-                          className="flex items-center gap-3 px-4 py-2.5 border-b border-[#2a2622]/50 hover:bg-[#1c1917]/60 transition-colors group"
-                        >
-                          {proc.icon ? (
-                            <img
-                              src={proc.icon}
-                              alt=""
-                              className="w-7 h-7 object-contain"
-                            />
-                          ) : (
-                            <div className="w-7 h-7 rounded bg-[#2a2622] flex items-center justify-center text-[10px] text-stone-500">
-                              ?
-                            </div>
-                          )}
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-stone-200 truncate">
-                              {proc.name}
-                            </p>
-                            <p className="text-[11px] text-stone-500 font-mono">
-                              PID {proc.pid} · {proc.memory_mb} MB ·{' '}
-                              {proc.cpu_usage.toFixed(1)}% CPU
-                            </p>
-                          </div>
-                          <div className="flex gap-1.5 shrink-0">
-                            <button
-                              onClick={() => toggleSavedName(proc.name)}
-                              className={`px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-all cursor-pointer ${
-                                saved
-                                  ? 'bg-red-500/15 border-red-500/30 text-red-400'
-                                  : 'bg-transparent border-[#2a2622] text-stone-500 hover:text-stone-300 hover:border-stone-600 opacity-0 group-hover:opacity-100'
-                              }`}
-                            >
-                              {saved ? 'Saved' : 'Save'}
-                            </button>
-                            <button
-                              onClick={() => toggleSessionPid(proc.pid)}
-                              className={`px-2.5 py-1 text-[11px] font-semibold rounded-md border transition-all cursor-pointer ${
-                                inSession
-                                  ? 'bg-amber-600/15 border-amber-600/30 text-amber-400'
-                                  : 'bg-[#1c1917] border-[#2a2622] text-stone-400 hover:border-stone-600'
-                              }`}
-                            >
-                              {inSession ? 'Queued' : 'Queue'}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-              <p className="text-[11px] text-stone-600 leading-relaxed">
-                <strong className="text-stone-500">Saved</strong> targets persist
-                across restarts (matched by process name).{' '}
-                <strong className="text-stone-500">Queued</strong> targets are
-                session-only and matched by PID.
-              </p>
-            </div>
-          )}
-
-          {/* ── Panic Action ── */}
-          {tab === 'action' && (
-            <div className="space-y-5 max-w-2xl">
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {PANIC_MODES.map((mode) => (
-                  <button
-                    key={mode.id}
+                    key={item.id}
                     type="button"
-                    onClick={() =>
-                      setSettings({ ...settings, panic_mode: mode.id })
-                    }
-                    className={`p-4 rounded-xl border text-left transition-all cursor-pointer ${
-                      settings.panic_mode === mode.id
-                        ? 'bg-amber-600/10 border-amber-600/40 ring-1 ring-amber-600/20'
-                        : 'bg-[#141210] border-[#2a2622] hover:border-stone-600'
+                    onClick={() => setTab(item.id)}
+                    className={`w-full text-left flex items-center gap-3 px-3 py-3 rounded-xl transition-all cursor-pointer border ${
+                        tab === item.id
+                            ? 'bg-amber-600/12 text-amber-300 border-amber-600/25 shadow-[inset_0_0_24px_rgba(217,119,6,0.035)]'
+                            : 'text-stone-400 hover:text-stone-200 hover:bg-[#1a1714] border-transparent'
                     }`}
-                  >
-                    <p
-                      className={`text-sm font-semibold ${
-                        settings.panic_mode === mode.id
-                          ? 'text-amber-400'
-                          : 'text-stone-200'
-                      }`}
-                    >
-                      {mode.label}
-                    </p>
-                    <p className="text-[11px] text-stone-500 mt-1 leading-snug">
-                      {mode.desc}
-                    </p>
-                  </button>
-                ))}
-              </div>
+                >
+                  <span className="w-6 text-center text-base opacity-75">{item.icon}</span>
+                  <span className="text-sm font-semibold">{item.label}</span>
+                </button>
+            ))}
+          </nav>
 
-              {settings.panic_mode === 'combo' && (
-                <div className="p-4 rounded-xl bg-[#141210] border border-[#2a2622] space-y-3">
-                  <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
-                    Combo actions
-                  </p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {COMBO_OPTIONS.map((opt) => (
-                      <label
-                        key={opt.id}
-                        className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-[#1c1917] border border-[#2a2622] cursor-pointer hover:border-stone-600 transition-all"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={settings.combo_modes.includes(opt.id)}
-                          onChange={() => toggleComboMode(opt.id)}
-                          className="w-3.5 h-3.5 accent-amber-600 cursor-pointer"
-                        />
-                        <span className="text-sm text-stone-300">
-                          {opt.label}
-                        </span>
-                      </label>
+          <div className="p-4 border-t border-guiso-border/70 space-y-2">
+            <div className="rounded-xl bg-guiso-surface border border-guiso-border p-3 space-y-2">
+              <Stat label="Shortcut" value={settings.active_shortcut} mono />
+              <Stat label="Persistent" value={`${savedCount}`} />
+              <Stat label="Session" value={`${sessionCount}`} />
+              <Stat label="Action" value={selectedMode?.label ?? settings.panic_mode} />
+            </div>
+          </div>
+        </aside>
+
+        <div className="flex-1 flex flex-col min-w-0">
+          <header data-tauri-drag-region className="shrink-0 flex items-start justify-between gap-4 px-7 py-5 border-b border-guiso-border/70 bg-[#0b0a09]/90">
+            <div className="min-w-0">
+              <h2 className="text-xl font-semibold tracking-tight text-stone-50">{TAB_META.find((item) => item.id === tab)?.label}</h2>
+              <p className="text-xs text-stone-500 mt-1 max-w-2xl">{TAB_META.find((item) => item.id === tab)?.help}</p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {dirty && <span className="mr-1 text-[10px] font-semibold uppercase tracking-wider text-amber-500">Unsaved</span>}
+              <button
+                  type="button"
+                  onClick={testPanic}
+                  disabled={isTestingPanic}
+                  className="px-3.5 py-2 text-xs font-bold rounded-lg bg-red-500/10 border border-red-500/25 text-red-300 hover:bg-red-500/15 transition disabled:opacity-50 cursor-pointer"
+              >
+                {isTestingPanic ? 'Triggering…' : 'Test Panic'}
+              </button>
+              <button
+                  type="button"
+                  onClick={() => void handleMinimizeToTray()}
+                  className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-[#181512] border border-guiso-border text-stone-400 hover:text-stone-200 hover:border-stone-600 transition cursor-pointer"
+              >
+                Hide to Tray
+              </button>
+            </div>
+          </header>
+
+          <main className="flex-1 overflow-y-auto custom-scrollbar p-7">
+            {tab === 'targets' && (
+                <section className="max-w-5xl space-y-5 animate-fade-in-up">
+                  <div className="grid grid-cols-3 gap-3">
+                    <SummaryCard title="Persistent" value={savedCount} detail="Matched by exact process name" />
+                    <SummaryCard title="Session" value={sessionCount} detail="PID + process start are verified" />
+                    <SummaryCard title="Next action" value={selectedMode?.label ?? 'Unknown'} detail="Runs after cleanup succeeds or fails" compact />
+                  </div>
+
+                  <div className="flex gap-3">
+                    <div className="relative flex-1">
+                      <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-stone-600">⌕</span>
+                      <input
+                          type="text"
+                          placeholder="Search process name or executable path…"
+                          value={search}
+                          onChange={(event) => setSearch(event.target.value)}
+                          className={`${inputClass} pl-9`}
+                      />
+                    </div>
+                    <button type="button" onClick={() => void fetchProcesses()} disabled={isRefreshing} className={secondaryButton}>
+                      {isRefreshing ? 'Scanning…' : 'Refresh'}
+                    </button>
+                  </div>
+
+                  {settings.saved_kill_processes.length > 0 && (
+                      <div className="rounded-2xl bg-[#11100e] border border-red-500/15 p-4">
+                        <div className="flex items-center justify-between gap-4 mb-3">
+                          <div>
+                            <p className="text-xs font-bold uppercase tracking-wider text-red-300/90">Persistent targets</p>
+                            <p className="text-[10px] text-stone-600 mt-1">Every running instance with these exact names is terminated at panic time.</p>
+                          </div>
+                          <button type="button" onClick={() => void saveKillList()} className="text-[11px] font-bold text-amber-400 hover:text-amber-300 cursor-pointer">
+                            Save targets now
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {settings.saved_kill_processes.map((name) => (
+                              <span key={name} className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/8 border border-red-500/18 text-red-200 text-xs font-medium">
+                        {name}
+                                <button type="button" aria-label={`Remove ${name}`} onClick={() => toggleSavedName(name)} className="text-red-300/50 hover:text-red-200 cursor-pointer">×</button>
+                      </span>
+                          ))}
+                        </div>
+                      </div>
+                  )}
+
+                  <div className="rounded-2xl border border-guiso-border overflow-hidden bg-[#12110f] shadow-xl shadow-black/10">
+                    <div className="grid grid-cols-[minmax(0,1fr)_auto] px-4 py-2.5 bg-[#171512] border-b border-guiso-border text-[10px] font-bold uppercase tracking-wider text-stone-600">
+                      <span>Running processes</span>
+                      <span>{filtered.length} shown</span>
+                    </div>
+                    <div className="max-h-[calc(100vh-380px)] overflow-y-auto custom-scrollbar">
+                      {filtered.length === 0 ? (
+                          <div className="p-10 text-center">
+                            <div className="text-2xl text-stone-700">⌁</div>
+                            <p className="mt-2 text-sm text-stone-500">No matching processes</p>
+                          </div>
+                      ) : filtered.map((process) => {
+                        const queued = sessionTargets.some((item) => item.pid === process.pid);
+                        const saved = isNameSaved(process.name);
+                        return (
+                            <div key={process.pid} className="group grid grid-cols-[minmax(0,1fr)_auto] gap-4 items-center px-4 py-3 border-b border-guiso-border/50 hover:bg-[#191613] transition">
+                              <div className="flex items-center gap-3 min-w-0">
+                                {process.icon ? (
+                                    <img src={process.icon} alt="" className="w-9 h-9 rounded-lg object-contain bg-[#0b0a09] border border-guiso-border" />
+                                ) : (
+                                    <div className="w-9 h-9 rounded-lg bg-[#201d19] border border-guiso-border flex items-center justify-center text-xs text-stone-600">?</div>
+                                )}
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <p className="text-sm font-semibold text-stone-200 truncate">{process.name}</p>
+                                    {!process.killable && <span className="shrink-0 px-1.5 py-0.5 rounded bg-stone-700/30 text-[9px] font-bold uppercase tracking-wide text-stone-500">Protected</span>}
+                                  </div>
+                                  <p className="text-[10px] text-stone-600 font-mono truncate max-w-162.5 mt-0.5">PID {process.pid} · {process.memory_mb} MB · {process.cpu_usage.toFixed(1)}% CPU{process.exe_path ? ` · ${process.exe_path}` : ''}</p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                    type="button"
+                                    disabled={!process.killable}
+                                    title={process.killable ? 'Persist this process name' : process.protection_reason ?? 'Protected process'}
+                                    onClick={() => toggleSavedName(process.name)}
+                                    className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-30 ${
+                                        saved ? 'bg-red-500/12 border-red-500/25 text-red-300' : 'opacity-0 group-hover:opacity-100 bg-[#1d1a17] border-guiso-border text-stone-400 hover:text-stone-200'
+                                    }`}
+                                >
+                                  {saved ? 'Saved' : 'Persist'}
+                                </button>
+                                <button
+                                    type="button"
+                                    disabled={!process.killable}
+                                    title={process.killable ? 'Queue this exact process instance for the next panic' : process.protection_reason ?? 'Protected process'}
+                                    onClick={() => void toggleSessionTarget(process)}
+                                    className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-bold transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-30 ${
+                                        queued ? 'bg-amber-600/12 border-amber-600/25 text-amber-300' : 'bg-[#1d1a17] border-guiso-border text-stone-400 hover:text-stone-200'
+                                    }`}
+                                >
+                                  {queued ? 'Queued' : 'Queue'}
+                                </button>
+                              </div>
+                            </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-amber-500/12 bg-amber-500/5 px-4 py-3 text-[10px] leading-relaxed text-stone-500">
+                    <span className="font-bold text-amber-300/80">Safety guard:</span> protected operating-system processes and Guiso itself cannot be queued or persisted. Session targets are verified by PID, name and process start time before termination, preventing most PID-reuse mistakes.
+                  </div>
+                </section>
+            )}
+
+            {tab === 'action' && (
+                <section className="max-w-4xl space-y-5 animate-fade-in-up">
+                  <div className="grid grid-cols-2 xl:grid-cols-3 gap-3">
+                    {PANIC_MODES.map((mode) => (
+                        <button
+                            key={mode.id}
+                            type="button"
+                            onClick={() => update({ panic_mode: mode.id })}
+                            className={`text-left p-4 rounded-2xl border transition ${
+                                settings.panic_mode === mode.id
+                                    ? 'bg-amber-600/9 border-amber-500/35 ring-1 ring-amber-500/15'
+                                    : 'bg-[#12110f] border-guiso-border hover:border-stone-700'
+                            }`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className={`text-sm font-bold ${settings.panic_mode === mode.id ? 'text-amber-300' : 'text-stone-200'}`}>{mode.label}</span>
+                            {settings.panic_mode === mode.id && <span className="text-[9px] font-bold uppercase tracking-wider text-amber-500">Selected</span>}
+                          </div>
+                          <p className="text-[11px] text-stone-500 mt-1.5 leading-relaxed">{mode.desc}</p>
+                        </button>
                     ))}
                   </div>
-                </div>
-              )}
 
-              {(settings.panic_mode === 'youtube' ||
-                settings.panic_mode === 'launch_app' ||
-                (settings.panic_mode === 'combo' &&
-                  settings.combo_modes.some(
-                    (m) => m === 'youtube' || m === 'launch_app',
-                  ))) && (
-                <Field
-                  label={
-                    settings.panic_mode === 'launch_app' ||
-                    settings.combo_modes.includes('launch_app')
-                      ? 'Application path'
-                      : 'YouTube URL'
-                  }
-                  hint={
-                    settings.panic_mode === 'launch_app' ||
-                    settings.combo_modes.includes('launch_app')
-                      ? 'Executable or script to spawn silently'
-                      : 'Watch or embed URL — auto-converted to embed'
-                  }
-                >
-                  <input
-                    type="text"
-                    value={settings.panic_target}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        panic_target: e.target.value,
-                      })
-                    }
-                    placeholder={
-                      settings.panic_mode === 'youtube' ||
-                      settings.combo_modes.includes('youtube')
-                        ? 'https://youtube.com/watch?v=…'
-                        : 'C:\\path\\to\\app.exe'
-                    }
-                    className={inputClass}
-                  />
-                </Field>
-              )}
-
-              {settings.panic_mode === 'local' && (
-                <>
-                  <Field label="Video file path" hint="Absolute path on disk">
-                    <input
-                      type="text"
-                      value={settings.local_video_path}
-                      onChange={(e) =>
-                        setSettings({
-                          ...settings,
-                          local_video_path: e.target.value,
-                        })
-                      }
-                      className={inputClass}
-                    />
-                  </Field>
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field label="Window title">
-                      <input
-                        type="text"
-                        value={settings.local_video_title}
-                        onChange={(e) =>
-                          setSettings({
-                            ...settings,
-                            local_video_title: e.target.value,
-                          })
-                        }
-                        className={inputClass}
-                      />
-                    </Field>
-                    <Field label="Start time (seconds)">
-                      <input
-                        type="number"
-                        min={0}
-                        value={settings.local_video_start_time}
-                        onChange={(e) =>
-                          setSettings({
-                            ...settings,
-                            local_video_start_time:
-                              parseInt(e.target.value) || 0,
-                          })
-                        }
-                        className={inputClass}
-                      />
-                    </Field>
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-
-          {/* ── Triggers ── */}
-          {tab === 'triggers' && (
-            <div className="space-y-5 max-w-2xl">
-              <div className="p-5 rounded-xl bg-[#141210] border border-[#2a2622] space-y-4">
-                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
-                  Global shortcut
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setIsRecordingShortcut(true)}
-                  className={`w-full text-left px-4 py-3 border rounded-lg text-sm font-mono transition-all cursor-pointer ${
-                    isRecordingShortcut
-                      ? 'bg-amber-600/10 border-amber-600/40 text-amber-400 animate-pulse'
-                      : 'bg-[#0a0908] border-[#2a2622] text-stone-200 hover:border-stone-600'
-                  }`}
-                >
-                  {isRecordingShortcut
-                    ? 'Press key combination…'
-                    : settings.active_shortcut}
-                </button>
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={settings.panic_hotkey_close}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        panic_hotkey_close: e.target.checked,
-                      })
-                    }
-                    className="w-4 h-4 accent-amber-600 cursor-pointer"
-                  />
-                  <span className="text-sm text-stone-300">
-                    Press shortcut again to dismiss overlay
-                  </span>
-                </label>
-              </div>
-
-              <div className="p-5 rounded-xl bg-[#141210] border border-[#2a2622] space-y-4">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
-                    Mouse gesture
-                  </p>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.gesture_enabled}
-                      onChange={(e) =>
-                        setSettings({
-                          ...settings,
-                          gesture_enabled: e.target.checked,
-                        })
-                      }
-                      className="w-4 h-4 accent-amber-600 cursor-pointer"
-                    />
-                    <span className="text-xs font-medium text-stone-400">
-                      Enabled
-                    </span>
-                  </label>
-                </div>
-
-                <div className="grid grid-cols-3 gap-3">
-                  {(['middle', 'right', 'left'] as const).map((btn) => (
-                    <button
-                      key={btn}
-                      type="button"
-                      onClick={() =>
-                        setSettings({ ...settings, gesture_button: btn })
-                      }
-                      className={`px-3 py-2 rounded-lg text-xs font-semibold border transition-all cursor-pointer capitalize ${
-                        settings.gesture_button === btn
-                          ? 'bg-amber-600/15 border-amber-600/35 text-amber-400'
-                          : 'bg-[#1c1917] border-[#2a2622] text-stone-500 hover:border-stone-600'
-                      }`}
-                    >
-                      {btn} click
-                    </button>
-                  ))}
-                </div>
-
-                <div>
-                  <div className="flex justify-between text-xs text-stone-500 mb-1.5">
-                    <span>Match strictness</span>
-                    <span className="font-mono text-stone-400">
-                      {settings.gesture_threshold.toFixed(2)}
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0.05}
-                    max={0.5}
-                    step={0.01}
-                    value={settings.gesture_threshold}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        gesture_threshold: parseFloat(e.target.value),
-                      })
-                    }
-                    className="w-full accent-amber-600 cursor-pointer"
-                  />
-                  <p className="text-[10px] text-stone-600 mt-1">
-                    Lower = stricter match. Recommended 0.15–0.25
-                  </p>
-                </div>
-
-                <div>
-                  <p className="text-[11px] font-semibold text-stone-500 uppercase tracking-wider mb-2">
-                    Draw your gesture
-                  </p>
-                  <canvas
-                    ref={canvasRef}
-                    width={420}
-                    height={180}
-                    onMouseDown={startDrawing}
-                    onMouseMove={draw}
-                    onMouseUp={finishDrawing}
-                    onMouseLeave={finishDrawing}
-                    className="w-full max-w-[420px] bg-[#0a0908] border border-dashed border-[#2a2622] rounded-lg cursor-crosshair hover:border-stone-600 transition-colors"
-                  />
-                  {gestureScore !== null && (
-                    <p className="text-[11px] text-stone-500 mt-2 font-mono">
-                      Test score: {gestureScore.toFixed(4)} (lower = better)
-                    </p>
+                  {settings.panic_mode === 'combo' && (
+                      <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-5 space-y-4">
+                        <div>
+                          <p className="text-xs font-bold uppercase tracking-wider text-stone-400">Combo actions</p>
+                          <p className="text-[10px] text-stone-600 mt-1">One media disguise can be combined with fade, glitch and a companion application.</p>
+                        </div>
+                        <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
+                          {COMBO_OPTIONS.map((option) => {
+                            const enabled = settings.combo_modes.includes(option.id);
+                            return (
+                                <button
+                                    key={option.id}
+                                    type="button"
+                                    onClick={() => toggleComboMode(option.id)}
+                                    className={`text-left p-3 rounded-xl border transition ${
+                                        enabled ? 'bg-amber-600/10 border-amber-500/25' : 'bg-[#181613] border-guiso-border hover:border-stone-700'
+                                    }`}
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <span className={`flex h-4 w-4 items-center justify-center rounded border text-[10px] ${enabled ? 'bg-amber-500 border-amber-400 text-black' : 'border-[#3a3530] text-transparent'}`}>✓</span>
+                                    <span className={`text-xs font-semibold ${enabled ? 'text-amber-200' : 'text-stone-300'}`}>{option.label}</span>
+                                  </div>
+                                  <p className="text-[10px] text-stone-600 mt-1.5 pl-6">{option.desc}</p>
+                                </button>
+                            );
+                          })}
+                        </div>
+                        {settings.combo_modes.length === 0 && (
+                            <div className="rounded-lg border border-red-500/15 bg-red-500/5 px-3 py-2 text-[10px] text-red-300/75">
+                              No combo actions are enabled. The panic will still clean up processes, but there will be no disguise overlay.
+                            </div>
+                        )}
+                      </div>
                   )}
-                </div>
-              </div>
-            </div>
-          )}
 
-          {/* ── Appearance ── */}
-          {tab === 'appearance' && color && (
-            <div className="space-y-5 max-w-2xl">
-              <div className="p-5 rounded-xl bg-[#141210] border border-[#2a2622] space-y-4">
-                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
-                  Overlay backdrop
-                </p>
-                <div className="flex items-center gap-4">
-                  <div className="relative w-12 h-10 rounded-lg overflow-hidden border border-[#2a2622] shrink-0">
-                    <input
-                      type="color"
-                      value={color.hex}
-                      onChange={(e) =>
-                        setSettings({
-                          ...settings,
-                          panic_color: hexToRgba(e.target.value, color.alpha),
-                        })
-                      }
-                      className="absolute -inset-2 w-[150%] h-[150%] cursor-pointer"
-                    />
-                  </div>
-                  <div className="flex-1">
-                    <div className="flex justify-between text-xs text-stone-500 mb-1">
-                      <span>Opacity</span>
-                      <span>{Math.round(color.alpha * 100)}%</span>
+                  {(settings.panic_mode === 'youtube' || (settings.panic_mode === 'combo' && settings.combo_modes.includes('youtube'))) && (
+                      <Field label="YouTube disguise URL" hint="Watch, Shorts, youtu.be, or embed URLs are converted to a fullscreen player.">
+                        <input className={inputClass} value={settings.youtube_url} onChange={(event) => update({ youtube_url: event.target.value })} placeholder="https://www.youtube.com/watch?v=…" />
+                      </Field>
+                  )}
+
+                  {(settings.panic_mode === 'launch_app' || (settings.panic_mode === 'combo' && settings.combo_modes.includes('launch_app'))) && (
+                      <Field label="Companion application" hint="Executable path, or a .bat/.cmd file on Windows. It is launched silently after target cleanup.">
+                        <input className={inputClass} value={settings.launch_app_path} onChange={(event) => update({ launch_app_path: event.target.value })} placeholder="C:\\path\\to\\app.exe" />
+                      </Field>
+                  )}
+
+                  {(settings.panic_mode === 'local' || (settings.panic_mode === 'combo' && settings.combo_modes.includes('local'))) && (
+                      <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-5 space-y-4">
+                        <Field label="Local video file" hint="Absolute path. The overlay uses Tauri's file asset protocol so Windows paths work reliably inside the webview.">
+                          <input className={inputClass} value={settings.local_video_path} onChange={(event) => update({ local_video_path: event.target.value })} placeholder="C:\\Videos\\disguise.mp4" />
+                        </Field>
+                        <div className="grid grid-cols-2 gap-4">
+                          <Field label="Window / video title">
+                            <input className={inputClass} value={settings.local_video_title} onChange={(event) => update({ local_video_title: event.target.value })} />
+                          </Field>
+                          <Field label="Start time (seconds)">
+                            <input className={inputClass} type="number" min={0} value={settings.local_video_start_time} onChange={(event) => update({ local_video_start_time: Math.max(0, Number.parseInt(event.target.value || '0', 10) || 0) })} />
+                          </Field>
+                        </div>
+                      </div>
+                  )}
+
+                  {mediaMode === undefined && settings.panic_mode !== 'launch_app' && (
+                      <div className="rounded-xl border border-blue-500/15 bg-blue-500/5 px-4 py-3 text-[10px] text-stone-500">
+                        This action is purely visual: it covers the screen after process cleanup and will auto-dismiss when its transient animation completes unless you configure an explicit timeout.
+                      </div>
+                  )}
+                </section>
+            )}
+
+            {tab === 'triggers' && (
+                <section className="max-w-3xl space-y-5 animate-fade-in-up">
+                  <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-5 space-y-4">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-stone-400">Global shortcut</p>
+                      <p className="text-[10px] text-stone-600 mt-1">Works even when Guiso is hidden in the tray.</p>
                     </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      value={color.alpha}
-                      onChange={(e) =>
-                        setSettings({
-                          ...settings,
-                          panic_color: hexToRgba(
-                            color.hex,
-                            parseFloat(e.target.value),
-                          ),
-                        })
-                      }
-                      className="w-full accent-amber-600 cursor-pointer"
-                    />
+                    <button
+                        type="button"
+                        onClick={() => setIsRecordingShortcut(true)}
+                        className={`w-full px-4 py-4 rounded-xl border text-left font-mono text-sm transition cursor-pointer ${
+                            isRecordingShortcut ? 'bg-amber-600/8 border-amber-500/30 text-amber-300 animate-pulse' : 'bg-[#0b0a09] border-guiso-border text-stone-200 hover:border-stone-700'
+                        }`}
+                    >
+                      {isRecordingShortcut ? 'Press the desired key combination…' : settings.active_shortcut}
+                    </button>
+                    <label className="flex items-center gap-3 rounded-xl border border-guiso-border bg-[#171512] px-3 py-3 cursor-pointer">
+                      <input type="checkbox" checked={settings.panic_hotkey_close} onChange={(event) => update({ panic_hotkey_close: event.target.checked })} className="w-4 h-4 accent-amber-600 cursor-pointer" />
+                      <div>
+                        <p className="text-xs font-semibold text-stone-300">Second shortcut closes the disguise</p>
+                        <p className="text-[10px] text-stone-600 mt-0.5">The second trigger never re-runs the kill list when this is enabled.</p>
+                      </div>
+                    </label>
                   </div>
-                </div>
-                <div
-                  className="h-16 rounded-lg border border-[#2a2622]"
-                  style={{
-                    backgroundColor: settings.panic_color,
-                    backdropFilter: `blur(${settings.panic_blur_px}px)`,
-                  }}
-                />
-              </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <Field label="Blur strength (px)">
-                  <input
-                    type="number"
-                    min={0}
-                    max={80}
-                    value={settings.panic_blur_px}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        panic_blur_px: parseInt(e.target.value) || 0,
-                      })
-                    }
-                    className={inputClass}
-                  />
-                </Field>
-                <Field label="Fade-in duration (ms)">
-                  <input
-                    type="number"
-                    min={0}
-                    max={5000}
-                    value={settings.panic_fade_ms}
-                    onChange={(e) =>
-                      setSettings({
-                        ...settings,
-                        panic_fade_ms: parseInt(e.target.value) || 0,
-                      })
-                    }
-                    className={inputClass}
-                  />
-                </Field>
-              </div>
+                  <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-5 space-y-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wider text-stone-400">Mouse gesture</p>
+                        <p className="text-[10px] text-stone-600 mt-1">Hold the selected mouse button, draw the stroke, then release that same button.</p>
+                      </div>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={settings.gesture_enabled} onChange={(event) => update({ gesture_enabled: event.target.checked })} className="w-4 h-4 accent-amber-600 cursor-pointer" />
+                        <span className="text-xs font-semibold text-stone-400">Enabled</span>
+                      </label>
+                    </div>
 
-              <Field
-                label="Auto-close overlay (ms)"
-                hint="0 = stay open until dismissed manually"
-              >
-                <input
-                  type="number"
-                  min={0}
-                  value={settings.panic_auto_close_ms}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      panic_auto_close_ms: parseInt(e.target.value) || 0,
-                    })
-                  }
-                  className={inputClass}
-                />
-              </Field>
-            </div>
-          )}
-        </main>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(['middle', 'right', 'left'] as const).map((button) => (
+                          <button key={button} type="button" onClick={() => update({ gesture_button: button })} className={`px-3 py-2.5 rounded-xl border text-xs font-bold capitalize transition cursor-pointer ${settings.gesture_button === button ? 'bg-amber-600/10 border-amber-500/30 text-amber-300' : 'bg-[#181613] border-guiso-border text-stone-500 hover:border-stone-700'}`}>
+                            {button} click
+                          </button>
+                      ))}
+                    </div>
 
-        {/* Footer save bar */}
-        <footer className="shrink-0 flex items-center justify-between px-6 py-3 border-t border-[#2a2622]/60 bg-[#0f0e0c]">
-          <p className="text-[11px] text-stone-600">
-            Panic kills targets first, then runs your configured action
-          </p>
-          <button
-            onClick={saveSettings}
-            disabled={isSaving}
-            className="px-5 py-2 text-sm font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 transition-all cursor-pointer disabled:opacity-50 shadow-[0_0_20px_rgba(217,119,6,0.15)]"
-          >
-            {isSaving ? 'Saving…' : 'Save Settings'}
-          </button>
-        </footer>
-      </div>
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-semibold text-stone-500">Recognition tolerance</span>
+                        <span className="font-mono text-xs text-stone-300">{settings.gesture_threshold.toFixed(2)}</span>
+                      </div>
+                      <input type="range" min={0.05} max={0.5} step={0.01} value={settings.gesture_threshold} onChange={(event) => update({ gesture_threshold: Number.parseFloat(event.target.value) })} className="w-full accent-amber-600 cursor-pointer" />
+                      <p className="text-[10px] text-stone-600 mt-1">Lower is stricter. 0.15–0.25 is a good starting range.</p>
+                    </div>
 
-      {/* Toast */}
-      {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg bg-[#1c1917] border border-[#2a2622] text-sm text-stone-200 shadow-xl animate-fade-in-up z-50">
-          {toast}
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <p className="text-[11px] font-bold uppercase tracking-wider text-stone-500">Draw the panic gesture</p>
+                        {gesturePoints.length > 0 && <button type="button" onClick={clearGesturePreview} className="text-[10px] text-stone-600 hover:text-stone-300 cursor-pointer">Clear canvas</button>}
+                      </div>
+                      <canvas
+                          ref={canvasRef}
+                          width={620}
+                          height={220}
+                          onPointerDown={startDrawing}
+                          onPointerMove={continueDrawing}
+                          onPointerUp={(event) => void finishDrawing(event)}
+                          onPointerCancel={(event) => void finishDrawing(event)}
+                          className="w-full bg-[#0b0a09] border border-dashed border-[#332e29] rounded-xl cursor-crosshair touch-none"
+                      />
+                      <div className="mt-2 flex items-center justify-between gap-3">
+                        <p className="text-[10px] text-stone-600">The backend normalizes scale and protects against empty/zero-length strokes.</p>
+                        {gestureScore !== null && <p className="text-[10px] font-mono text-stone-400">Score {gestureScore.toFixed(4)} · lower is better</p>}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+            )}
+
+            {tab === 'appearance' && (
+                <section className="max-w-3xl space-y-5 animate-fade-in-up">
+                  <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-5 space-y-4">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-stone-400">Overlay backdrop</p>
+                      <p className="text-[10px] text-stone-600 mt-1">The cover remains opaque enough to hide the desktop while media layers sit above it.</p>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <div className="relative w-14 h-12 rounded-xl overflow-hidden border border-guiso-border shrink-0">
+                        <input type="color" value={color.hex} onChange={(event) => update({ panic_color: hexToRgba(event.target.value, color.alpha) })} className="absolute -inset-2 w-[150%] h-[150%] cursor-pointer" />
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center justify-between text-xs text-stone-500 mb-1.5">
+                          <span>Opacity</span>
+                          <span className="font-mono text-stone-300">{Math.round(color.alpha * 100)}%</span>
+                        </div>
+                        <input type="range" min={0} max={1} step={0.01} value={color.alpha} onChange={(event) => update({ panic_color: hexToRgba(color.hex, Number.parseFloat(event.target.value)) })} className="w-full accent-amber-600 cursor-pointer" />
+                      </div>
+                    </div>
+                    <div className="h-24 rounded-xl border border-guiso-border overflow-hidden" style={{ backgroundColor: settings.panic_color, backdropFilter: `blur(${settings.panic_blur_px}px)` }}>
+                      <div className="h-full flex items-end p-3 text-[10px] text-white/40">Panic cover preview</div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="Blur strength (px)" hint="0–80 px">
+                      <input className={inputClass} type="number" min={0} max={80} value={settings.panic_blur_px} onChange={(event) => update({ panic_blur_px: Math.min(80, Math.max(0, Number.parseInt(event.target.value || '0', 10) || 0)) })} />
+                    </Field>
+                    <Field label="Fade-in duration (ms)" hint="0–5000 ms">
+                      <input className={inputClass} type="number" min={0} max={5000} value={settings.panic_fade_ms} onChange={(event) => update({ panic_fade_ms: Math.min(5000, Math.max(0, Number.parseInt(event.target.value || '0', 10) || 0)) })} />
+                    </Field>
+                  </div>
+
+                  <Field label="Auto-close overlay (ms)" hint="0 = media disguises stay open; transient fade/glitch actions still have a safe default lifetime.">
+                    <input className={inputClass} type="number" min={0} value={settings.panic_auto_close_ms} onChange={(event) => update({ panic_auto_close_ms: Math.max(0, Number.parseInt(event.target.value || '0', 10) || 0) })} />
+                  </Field>
+
+                  <div className="rounded-xl border border-blue-500/12 bg-blue-500/5 px-4 py-3 text-[10px] leading-relaxed text-stone-500">
+                    <span className="font-semibold text-blue-300/70">Dismissal:</span> Escape or the close button only closes the disguise; it never re-executes process cleanup. The configured panic shortcut can also close the overlay when the toggle above is enabled.
+                  </div>
+                </section>
+            )}
+          </main>
+
+          <footer className="shrink-0 flex items-center justify-between gap-4 px-7 py-3 border-t border-guiso-border/70 bg-[#0f0e0c]">
+            <p className="text-[10px] text-stone-600">Cleanup runs first. Only then does the disguise open. Failed process termination is logged and never blocks the disguise.</p>
+            <button type="button" onClick={() => void saveSettings()} disabled={isSaving || !dirty} className="px-5 py-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 text-xs font-black transition disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer">
+              {isSaving ? 'Saving…' : dirty ? 'Save Settings' : 'Saved'}
+            </button>
+          </footer>
         </div>
-      )}
-    </div>
+
+        {toast && (
+            <div className="fixed left-1/2 bottom-6 -translate-x-1/2 z-100 max-w-lg px-4 py-3 rounded-xl bg-[#1b1815] border border-[#3b342e] text-xs font-semibold text-stone-200 shadow-2xl animate-fade-in-up">
+              {toast}
+            </div>
+        )}
+      </div>
   );
 }
 
-const inputClass =
-  'w-full px-4 py-2.5 bg-[#0a0908] border border-[#2a2622] rounded-lg text-sm text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-600/50 focus:ring-1 focus:ring-amber-600/30 select-text';
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
+function Stat({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="space-y-1.5">
-      <label className="block text-xs font-semibold text-stone-400">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[10px] text-stone-600">{hint}</p>}
-    </div>
+      <div className="flex items-center justify-between gap-3 text-[10px]">
+        <span className="text-stone-600">{label}</span>
+        <span className={`text-stone-300 truncate max-w-36.25 ${mono ? 'font-mono text-amber-500/80' : ''}`}>{value}</span>
+      </div>
   );
 }
+
+function SummaryCard({ title, value, detail, compact = false }: { title: string; value: string | number; detail: string; compact?: boolean }) {
+  return (
+      <div className="rounded-2xl bg-[#12110f] border border-guiso-border p-4">
+        <p className="text-[10px] font-bold uppercase tracking-wider text-stone-600">{title}</p>
+        <p className={`mt-1 font-bold text-stone-100 ${compact ? 'text-sm truncate' : 'text-2xl'}`}>{value}</p>
+        <p className="mt-1 text-[10px] text-stone-600 leading-relaxed">{detail}</p>
+      </div>
+  );
+}
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+      <div className="space-y-1.5">
+        <label className="block text-xs font-bold text-stone-400">{label}</label>
+        {children}
+        {hint && <p className="text-[10px] text-stone-600 leading-relaxed">{hint}</p>}
+      </div>
+  );
+}
+
+const secondaryButton = 'px-4 py-2.5 rounded-lg bg-[#181512] border border-guiso-border text-xs font-bold text-stone-400 hover:text-stone-200 hover:border-stone-700 transition cursor-pointer disabled:opacity-50';
+const inputClass = 'w-full px-4 py-2.5 rounded-xl bg-[#0b0a09] border border-guiso-border text-sm text-stone-200 placeholder-stone-700 focus:outline-none focus:border-amber-600/45 focus:ring-1 focus:ring-amber-600/15 select-text';
