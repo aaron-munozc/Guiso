@@ -5,7 +5,7 @@
   "identifier": "com.guiso.desktop",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1776",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
@@ -17,7 +17,8 @@
         "width": 960,
         "height": 680,
         "minWidth": 720,
-        "minHeight": 520
+        "minHeight": 520,
+        "transparent": true
       }
     ],
     "security": {

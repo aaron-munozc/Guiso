@@ -1,76 +1,37 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
 @theme {
-  --font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-
-  --color-guiso-bg: #0a0908;
-  --color-guiso-surface: #141210;
-  --color-guiso-elevated: #1c1917;
-  --color-guiso-border: #2a2622;
-  --color-guiso-muted: #78716c;
-  --color-guiso-accent: #d97706;
-  --color-guiso-accent-dim: #92400e;
-  --color-guiso-danger: #ef4444;
-
-  --guiso-radius-sm: 6px;
-  --guiso-radius-md: 9px;
-  --guiso-radius-lg: 12px;
-
-  --guiso-transition-fast: 120ms;
-  --guiso-transition-normal: 180ms;
-  --guiso-transition-slow: 280ms;
+  --color-guiso-bg: #080706;
+  --color-guiso-sidebar: #0d0c0b;
+  --color-guiso-header: #0b0a09;
+  --color-guiso-footer: #0d0c0b;
+  --color-guiso-panel: #11100e;
+  --color-guiso-panel-strong: #15130f;
+  --color-guiso-border: #25211d;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-Global reset / rendering
-────────────────────────────────────────────────────────────────────────── */
-
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #080706;
+  color: #e7e5e4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
 }
 
 html,
 body,
 #root {
   width: 100%;
+  min-width: 100%;
   height: 100%;
-  min-width: 0;
-  min-height: 0;
+  min-height: 100%;
   margin: 0;
-  padding: 0;
   overflow: hidden;
+  background: #080706;
 }
 
-html {
-  color-scheme: dark;
-  background: var(--color-guiso-bg);
-  text-rendering: optimizeLegibility;
-}
-
-body {
-  min-height: 100vh;
-  font-family: var(--font-sans);
-  background: var(--color-guiso-bg);
-  color: #e7e5e4;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-size-adjust: 100%;
-  -webkit-text-size-adjust: 100%;
-}
-
-/* Prevent media from causing accidental layout overflow. */
-img,
-svg,
-video,
-canvas,
-iframe {
-  display: block;
-  max-width: 100%;
-}
-
-/* Native controls should inherit the application's visual language. */
 button,
 input,
 textarea,
@@ -78,48 +39,27 @@ select {
   font: inherit;
 }
 
-button {
-  -webkit-tap-highlight-color: transparent;
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgb(245 158 11 / 0.35);
+  outline-offset: 2px;
 }
-
-/* Keep hidden native UI elements genuinely hidden. */
-[hidden] {
-  display: none !important;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Selection
-────────────────────────────────────────────────────────────────────────── */
 
 ::selection {
-  background: rgba(217, 119, 6, 0.28);
+  background: rgb(245 158 11 / 0.18);
   color: #fff7ed;
 }
 
-/*
-
-* The main app intentionally uses select-none for most controls, but fields
-* and editable regions should still be selectable.
-  */
-.select-text,
-input,
-textarea {
-  user-select: text;
-  -webkit-user-select: text;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Scrollbars
-────────────────────────────────────────────────────────────────────────── */
-
 .custom-scrollbar {
+  scrollbar-color: #302a24 transparent;
   scrollbar-width: thin;
-  scrollbar-color: #3f3a36 transparent;
 }
 
 .custom-scrollbar::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-track {
@@ -127,171 +67,51 @@ Scrollbars
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: #3f3a36;
-  border: 1px solid transparent;
   border-radius: 999px;
+  background: #302a24;
+  border: 2px solid transparent;
   background-clip: padding-box;
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: #57534e;
+  background: #473d33;
+  border: 1px solid transparent;
   background-clip: padding-box;
 }
 
-.custom-scrollbar::-webkit-scrollbar-corner {
-  background: transparent;
+input[type='range'] {
+  height: 5px;
+  accent-color: #f59e0b;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-Tauri window dragging
-────────────────────────────────────────────────────────────────────────── */
-
-[data-tauri-drag-region] {
-  -webkit-app-region: drag;
-  app-region: drag;
+input[type='range']::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 999px;
+  background: #241f1a;
 }
 
-[data-tauri-drag-region] button,
-[data-tauri-drag-region] input,
-[data-tauri-drag-region] textarea,
-[data-tauri-drag-region] select,
-[data-tauri-drag-region] a,
-[data-tauri-drag-region] [role="button"] {
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
+input[type='range']::-webkit-slider-thumb {
+  margin-top: -4px;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-Focus
-────────────────────────────────────────────────────────────────────────── */
-
-:focus {
-  outline: none;
+.theme-dim {
+  --color-guiso-bg: #0c0b0a;
 }
-
-:focus-visible {
-  outline: 1px solid rgba(245, 158, 11, 0.72);
-  outline-offset: 2px;
-}
-
-/*
-
-* Don't put a focus ring around the panic overlay itself. The overlay should
-* remain visually clean and behave like a fullscreen disguise.
-  */
-.panic-overlay :focus-visible {
-  outline: none;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Main application animations
-────────────────────────────────────────────────────────────────────────── */
 
 @keyframes fade-in-up {
   from {
     opacity: 0;
-    transform: translate3d(0, 6px, 0);
+    transform: translateY(6px);
   }
-
   to {
     opacity: 1;
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-@keyframes pulse-ring {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.32);
-  }
-
-  50% {
-    box-shadow: 0 0 0 6px rgba(217, 119, 6, 0);
+    transform: translateY(0);
   }
 }
 
 .animate-fade-in-up {
-  animation: fade-in-up var(--guiso-transition-slow) ease-out both;
+  animation: fade-in-up 220ms ease-out both;
 }
-
-.animate-pulse-ring {
-  animation: pulse-ring 2s ease-in-out infinite;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Panic overlay
-────────────────────────────────────────────────────────────────────────── */
-
-/*
-
-* The CSS variables are supplied by panic.tsx:
-*
-* --panic-fade-ms
-* --panic-exit-ms
-*
-* Keeping the durations configurable means the frontend and settings stay
-* synchronized instead of having a hard-coded exit duration.
-  */
-
-@keyframes overlay-fade-in {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
-@keyframes overlay-fade-out {
-  from {
-    opacity: 1;
-  }
-
-  to {
-    opacity: 0;
-  }
-}
-
-.panic-overlay-enter {
-  animation:
-          overlay-fade-in
-          var(--panic-fade-ms, 600ms)
-          cubic-bezier(0.22, 1, 0.36, 1)
-          forwards;
-}
-
-.panic-overlay-exit {
-  animation:
-          overlay-fade-out
-          var(--panic-exit-ms, 700ms)
-          ease-in
-          forwards;
-}
-
-/*
-
-* The overlay should sit on its own compositing layer. This matters more for
-* the glitch/screenshot disguise because it prevents the entire application
-* behind it from being repeatedly repainted.
-  */
-.panic-overlay {
-  isolation: isolate;
-  contain: strict;
-  transform: translateZ(0);
-  will-change: opacity;
-}
-
-/* Glitch imagery can be composited independently. */
-.panic-overlay .glitch-a,
-.panic-overlay .glitch-b {
-  will-change: transform, clip-path, opacity;
-  backface-visibility: hidden;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Reduced motion
-────────────────────────────────────────────────────────────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -302,60 +122,4 @@ Reduced motion
     animation-iteration-count: 1 !important;
     transition-duration: 1ms !important;
   }
-
-  .animate-pulse-ring {
-    animation: none;
-  }
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Panic / disguise safety behavior
-────────────────────────────────────────────────────────────────────────── */
-
-/*
-
-* Prevent accidental text selection or image dragging while the disguise
-* is active. The overlay behaves more like a surface than a web page.
-  */
-.panic-overlay,
-.panic-overlay img,
-.panic-overlay video,
-.panic-overlay iframe {
-  user-select: none;
-  -webkit-user-select: none;
-  -webkit-user-drag: none;
-}
-
-/*
-
-* Make fullscreen video behave predictably without introducing layout
-* calculations during playback.
-  */
-.panic-overlay video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-/*
-
-* Iframe-based disguises should never expose a default border or inline
-* baseline behavior.
-  */
-.panic-overlay iframe {
-  width: 100%;
-  height: 100%;
-  border: 0;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
-Utility
-────────────────────────────────────────────────────────────────────────── */
-
-.no-scroll {
-  overflow: hidden !important;
-}
-
-.guiso-hidden {
-  display: none !important;
 }

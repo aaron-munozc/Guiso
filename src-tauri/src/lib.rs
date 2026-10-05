@@ -21,10 +21,13 @@ use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::webview::Color;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_store::{StoreBuilder, StoreExt};
 use xcap::Monitor;
+
+const RESCUE_SHORTCUT: &str = "CmdOrCtrl+Alt+Escape";
 
 // ─── Gesture mathematics ──────────────────────────────────────────────────────
 
@@ -200,7 +203,7 @@ impl Default for UserSettings {
             gesture_threshold: 0.20,
             panic_gesture: Vec::new(),
 
-            panic_mode: "youtube".into(),
+            panic_mode: "fade".into(),
             panic_target: String::new(),
             youtube_url: String::new(),
             launch_app_path: String::new(),
@@ -208,7 +211,7 @@ impl Default for UserSettings {
             local_video_title: "Video Player".into(),
             local_video_start_time: 0,
             panic_fade_ms: 600,
-            panic_color: "rgba(15, 15, 15, 0.97)".into(),
+            panic_color: "rgba(8, 7, 6, 1.00)".into(),
             panic_blur_px: 20,
             panic_auto_close_ms: 0,
             panic_hotkey_close: true,
@@ -232,8 +235,12 @@ fn sanitize_settings(mut settings: UserSettings) -> UserSettings {
         settings.gesture_button = "middle".into();
     }
     settings.gesture_threshold = settings.gesture_threshold.clamp(0.05, 0.50);
+    if settings.active_shortcut.trim().is_empty() || settings.active_shortcut == RESCUE_SHORTCUT {
+        settings.active_shortcut = "CmdOrCtrl+Shift+K".into();
+    }
     settings.panic_fade_ms = settings.panic_fade_ms.clamp(0, 5_000);
     settings.panic_blur_px = settings.panic_blur_px.clamp(0, 80);
+    settings.panic_auto_close_ms = settings.panic_auto_close_ms.min(300_000);
     settings.local_video_title = if settings.local_video_title.trim().is_empty() {
         "Video Player".into()
     } else {
@@ -278,6 +285,11 @@ fn sanitize_settings(mut settings: UserSettings) -> UserSettings {
         combo.insert(0, media_mode);
     }
     settings.combo_modes = combo;
+
+    settings.theme = match settings.theme.as_str() {
+        "dark" | "dim" => settings.theme,
+        _ => "dark".into(),
+    };
 
     settings.saved_kill_processes = settings
         .saved_kill_processes
@@ -615,7 +627,7 @@ fn get_queued_pids(state: tauri::State<'_, AppState>) -> Vec<QueuedProcess> {
 
 #[tauri::command]
 fn save_kill_list(
-    app: tauri::AppHandle,
+    app: AppHandle,
     names: Vec<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
@@ -646,11 +658,14 @@ fn get_settings(state: tauri::State<'_, AppState>) -> UserSettings {
 
 #[tauri::command]
 fn update_settings(
-    app: tauri::AppHandle,
+    app: AppHandle,
     new_settings: UserSettings,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let sanitized = sanitize_settings(new_settings);
+    if sanitized.active_shortcut == RESCUE_SHORTCUT {
+        return Err(format!("{RESCUE_SHORTCUT} is reserved for emergency overlay recovery"));
+    }
     let old_shortcut = state.settings.lock().unwrap().active_shortcut.clone();
 
     if old_shortcut != sanitized.active_shortcut {
@@ -681,7 +696,7 @@ fn update_settings(
 
 #[tauri::command]
 fn save_gesture(
-    app: tauri::AppHandle,
+    app: AppHandle,
     raw_points: Vec<Point>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
@@ -705,18 +720,58 @@ fn get_last_screenshot(state: tauri::State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-fn trigger_panic(app: tauri::AppHandle) {
+fn trigger_panic(app: AppHandle) {
     guiso_process(app);
 }
 
+fn open_panic_preview(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let settings = sanitize_settings(state.settings.lock().unwrap().clone());
+    if !needs_overlay(&settings) {
+        return Err("This configuration has no visual overlay to preview.".into());
+    }
+    if overlay_is_present(app) || *state.panic_active.lock().unwrap() {
+        return Err("A panic overlay is already active.".into());
+    }
+
+    if wants_mode(&settings, "glitch") {
+        take_screenshot(app);
+    }
+
+    {
+        let mut active = state.panic_active.lock().unwrap();
+        if *active {
+            return Err("A panic operation is already active.".into());
+        }
+        *active = true;
+    }
+    let generation = {
+        let mut generation = state.panic_generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        *generation
+    };
+
+    spawn_overlay(app, &settings, generation, true);
+    Ok(())
+}
+
 #[tauri::command]
-fn close_panic(app: tauri::AppHandle, state: tauri::State<'_, AppState>) {
+fn preview_panic(app: AppHandle) -> Result<(), String> {
+    open_panic_preview(&app)
+}
+
+fn do_close_panic(app: &AppHandle, state: &AppState) {
     if let Some(window) = app.get_webview_window("panic_overlay") {
         let _ = window.close();
     }
     *state.panic_active.lock().unwrap() = false;
     let mut generation = state.panic_generation.lock().unwrap();
     *generation = generation.wrapping_add(1);
+}
+
+#[tauri::command]
+fn close_panic(app: AppHandle, state: tauri::State<'_, AppState>) {
+    do_close_panic(&app, &state);
 }
 
 #[tauri::command]
@@ -756,32 +811,124 @@ fn take_screenshot(app: &AppHandle) {
     }
 }
 
-fn build_overlay(app: &AppHandle, settings: &UserSettings) -> Result<(), String> {
-    let title = if wants_mode(settings, "local") {
-        if settings.local_video_title.trim().is_empty() {
-            "System Process".into()
-        } else {
-            settings.local_video_title.clone()
-        }
-    } else {
-        "System Process".into()
-    };
+fn spawn_overlay(app: &AppHandle, settings: &UserSettings, generation: u64, preview: bool) {
+    // Tauri documents a Windows deadlock hazard when WebviewWindowBuilder::new
+    // is called synchronously from commands/event handlers. The global shortcut
+    // and tray callbacks are event handlers, so the actual window creation lives
+    // on its own thread.
+    let handle = app.clone();
+    let settings = settings.clone();
 
-    WebviewWindowBuilder::new(
-        app,
-        "panic_overlay",
-        WebviewUrl::App("/panic".into()),
-    )
-        .title(&title)
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        {
+            let current_generation = *state.panic_generation.lock().unwrap();
+            if current_generation != generation || !*state.panic_active.lock().unwrap() {
+                return;
+            }
+        }
+
+        let title = if wants_mode(&settings, "local") {
+            if settings.local_video_title.trim().is_empty() {
+                "System Process".to_string()
+            } else {
+                settings.local_video_title.clone()
+            }
+        } else {
+            "System Process".to_string()
+        };
+
+        let result = WebviewWindowBuilder::new(
+            &handle,
+            "panic_overlay",
+            WebviewUrl::App(if preview { "/panic?preview=1".into() } else { "/panic".into() }),
+        )
+        .title(title)
         .decorations(false)
+        .maximized(true)
         .fullscreen(true)
         .always_on_top(true)
-        .transparent(false)
+        .focused(true)
+        .focusable(true)
+        .closable(false)
+        .visible(false)
+        .shadow(false)
+        .transparent(true)
+        .background_color(Color(0, 0, 0, 0))
         .skip_taskbar(true)
         .resizable(false)
-        .build()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .build();
+
+        let window = match result {
+            Ok(window) => window,
+            Err(error) => {
+                eprintln!("[guiso] failed to build panic overlay: {error}");
+                let state = handle.state::<AppState>();
+                let current_generation = *state.panic_generation.lock().unwrap();
+                if current_generation == generation {
+                    *state.panic_active.lock().unwrap() = false;
+                }
+                return;
+            }
+        };
+
+        // Panic surfaces never need pointer interaction. Making the native window
+        // click-through means mouse input goes straight to the app underneath,
+        // while the focused webview still receives Escape for recovery.
+        if let Err(error) = window.set_ignore_cursor_events(true) {
+            eprintln!("[guiso] could not enable click-through panic overlay: {error}");
+        }
+
+        // A second lifecycle check closes an overlay if the user hit the trigger
+        // again while the WebView was being created. This prevents stale windows.
+        let stale = {
+            let state = handle.state::<AppState>();
+            let current_generation = *state.panic_generation.lock().unwrap();
+            current_generation != generation || !*state.panic_active.lock().unwrap()
+        };
+
+        if stale {
+            let _ = window.close();
+            return;
+        }
+
+        if let Err(error) = window.show() {
+            eprintln!("[guiso] failed to show panic overlay: {error}");
+            let _ = window.close();
+            let state = handle.state::<AppState>();
+            let current_generation = *state.panic_generation.lock().unwrap();
+            if current_generation == generation {
+                *state.panic_active.lock().unwrap() = false;
+            }
+            return;
+        }
+        let _ = window.set_focus();
+
+        // Only keep media modes persistent when they actually have usable input.
+        // Media modes are persistent unless the user configured an explicit
+        // timeout. Pure visual modes are transient: they finish their visual
+        // transition and then the native transparent window is destroyed.
+        let has_persistent_media =
+            (wants_mode(&settings, "youtube") && !settings.youtube_url.trim().is_empty())
+                || (wants_mode(&settings, "local") && !settings.local_video_path.trim().is_empty());
+        let transient_ms = settings.panic_fade_ms.max(160).saturating_add(1_200);
+
+        let hard_close_ms = if preview {
+            10_000
+        } else if has_persistent_media {
+            if settings.panic_auto_close_ms > 0 {
+                settings.panic_auto_close_ms.saturating_add(450)
+            } else {
+                0
+            }
+        } else {
+            transient_ms.saturating_add(450)
+        };
+
+        if hard_close_ms > 0 {
+            schedule_overlay_close(&handle, generation, hard_close_ms);
+        }
+    });
 }
 
 fn schedule_overlay_close(app: &AppHandle, generation: u64, delay_ms: u64) {
@@ -812,11 +959,9 @@ fn guiso_process(app: AppHandle) {
     let state = app.state::<AppState>();
     let settings = sanitize_settings(state.settings.lock().unwrap().clone());
 
-    // Re-entry is a deliberate toggle only when the user enabled it. Otherwise
-    // a repeated signal is ignored instead of killing/relaunching everything.
     if overlay_is_present(&app) || *state.panic_active.lock().unwrap() {
         if settings.panic_hotkey_close {
-            close_panic(app, state);
+            do_close_panic(&app, &state);
         }
         return;
     }
@@ -879,31 +1024,9 @@ fn guiso_process(app: AppHandle) {
         return;
     }
 
-    // Build only after cleanup. A failed build must release the active latch so
-    // the next trigger can still recover.
-    if let Err(error) = build_overlay(&app, &settings) {
-        eprintln!("[guiso] failed to build panic overlay: {error}");
-        *state.panic_active.lock().unwrap() = false;
-        return;
-    }
-
-    // The explicit timer is a hard safety net. The frontend starts the visual
-    // exit slightly before this deadline when possible. A zero setting means
-    // persistent for media disguises and a sensible transient lifetime for
-    // fade/glitch-only disguises.
-    let hard_close_ms = if settings.panic_auto_close_ms > 0 {
-        // Give the frontend enough time to run its exit animation before the
-        // backend's hard safety close.
-        settings.panic_auto_close_ms.saturating_add(450)
-    } else if wants_mode(&settings, "youtube") || wants_mode(&settings, "local") {
-        0
-    } else {
-        settings.panic_fade_ms.saturating_add(1_400)
-    };
-
-    if hard_close_ms > 0 {
-        schedule_overlay_close(&app, generation, hard_close_ms);
-    }
+    // Build only after cleanup. Actual WebView creation is deliberately moved
+    // off the shortcut/tray event thread (see spawn_overlay).
+    spawn_overlay(&app, &settings, generation, false);
 }
 
 // ─── Application startup ──────────────────────────────────────────────────────
@@ -954,10 +1077,26 @@ pub fn run() {
                 eprintln!("[guiso] invalid saved shortcut '{}'; use Settings to fix it", saved.active_shortcut);
             }
 
+            if saved.active_shortcut != RESCUE_SHORTCUT {
+                if let Ok(rescue) = Shortcut::from_str(RESCUE_SHORTCUT) {
+                    if let Err(error) = app.global_shortcut().on_shortcut(rescue, |handle, _, event| {
+                        if event.state == ShortcutState::Pressed {
+                            let state = handle.state::<AppState>();
+                            if *state.panic_active.lock().unwrap() || overlay_is_present(&handle) {
+                                do_close_panic(&handle, &state);
+                            }
+                        }
+                    }) {
+                        eprintln!("[guiso] could not register rescue shortcut: {error}");
+                    }
+                }
+            }
+
             let show = MenuItem::with_id(app, "show", "Open Settings", true, None::<&str>)?;
-            let panic = MenuItem::with_id(app, "panic", "⚡ Trigger Panic", true, None::<&str>)?;
+            let preview = MenuItem::with_id(app, "preview", "Preview Panic", true, None::<&str>)?;
+            let panic = MenuItem::with_id(app, "panic", "Trigger Panic", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &panic, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &preview, &panic, &quit])?;
 
             let mut tray = TrayIconBuilder::new()
                 .menu(&menu)
@@ -965,6 +1104,11 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => app.exit(0),
                     "panic" => guiso_process(app.clone()),
+                    "preview" => {
+                        if let Err(error) = open_panic_preview(app) {
+                            eprintln!("[guiso] preview failed: {error}");
+                        }
+                    }
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
@@ -1102,6 +1246,7 @@ pub fn run() {
             save_gesture,
             test_gesture_score,
             trigger_panic,
+            preview_panic,
             close_panic,
             is_panic_active,
             get_last_screenshot,

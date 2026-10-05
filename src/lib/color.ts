@@ -7,24 +7,55 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function byte(value: string) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? clamp(parsed, 0, 255) : 15;
+}
+
+function alphaValue(value: string | undefined) {
+  if (value === undefined) return 1;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? clamp(parsed, 0, 1) : 1;
+}
+
 export function parseRgba(value: string): ParsedRgba {
-  const match = value
-      .trim()
-      .match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/i);
+  const input = value.trim();
 
-  if (!match) return { hex: '#0F0F0F', alpha: 0.97 };
+  const rgba = input.match(
+    /^rgba?\(\s*(\d+)\s*[, ]\s*(\d+)\s*[, ]\s*(\d+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i,
+  );
 
-  const r = clamp(Number(match[1]), 0, 255);
-  const g = clamp(Number(match[2]), 0, 255);
-  const b = clamp(Number(match[3]), 0, 255);
-  const alpha = clamp(match[4] === undefined ? 1 : Number(match[4]), 0, 1);
+  if (rgba) {
+    const alpha = rgba[4]?.endsWith('%')
+      ? clamp(Number.parseFloat(rgba[4]) / 100, 0, 1)
+      : alphaValue(rgba[4]);
+    return {
+      hex: `#${[rgba[1], rgba[2], rgba[3]]
+        .map(byte)
+        .map((channel) => channel.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase()}`,
+      alpha,
+    };
+  }
 
-  const hex = `#${[r, g, b]
-      .map((channel) => channel.toString(16).padStart(2, '0'))
-      .join('')
-      .toUpperCase()}`;
+  if (/^#[0-9a-f]{3}$/i.test(input)) {
+    return {
+      hex: `#${input
+        .slice(1)
+        .split('')
+        .map((channel) => channel + channel)
+        .join('')
+        .toUpperCase()}`,
+      alpha: 1,
+    };
+  }
 
-  return { hex, alpha };
+  if (/^#[0-9a-f]{6}$/i.test(input)) {
+    return { hex: input.toUpperCase(), alpha: 1 };
+  }
+
+  return { hex: '#0F0F0F', alpha: 0.97 };
 }
 
 export function hexToRgba(hex: string, alpha: number) {

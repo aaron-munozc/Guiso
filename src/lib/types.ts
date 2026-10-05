@@ -22,12 +22,12 @@ export interface QueuedProcess {
 }
 
 export type PanicMode =
-    | 'youtube'
-    | 'local'
-    | 'fade'
-    | 'glitch'
-    | 'launch_app'
-    | 'combo';
+  | 'youtube'
+  | 'local'
+  | 'fade'
+  | 'glitch'
+  | 'launch_app'
+  | 'combo';
 
 export type ComboMode = 'fade' | 'youtube' | 'local' | 'glitch' | 'launch_app';
 
@@ -57,19 +57,19 @@ export interface UserSettings {
   theme: string;
 }
 
-export const PANIC_MODES: { id: PanicMode; label: string; desc: string }[] = [
-  { id: 'youtube', label: 'YouTube', desc: 'Fullscreen web video disguise' },
-  { id: 'local', label: 'Local Video', desc: 'Fullscreen video from your disk' },
-  { id: 'fade', label: 'Color Fade', desc: 'Instant solid-color cover' },
-  { id: 'glitch', label: 'Glitch', desc: 'Pre-panic screenshot with interference' },
-  { id: 'launch_app', label: 'Launch App', desc: 'Start a configured program without an overlay' },
-  { id: 'combo', label: 'Combo', desc: 'Combine one media disguise with visual effects' },
+export const PANIC_MODES: { id: PanicMode; label: string; desc: string; icon: string }[] = [
+  { id: 'youtube', label: 'YouTube', desc: 'Fullscreen web video disguise', icon: '▶' },
+  { id: 'local', label: 'Local Video', desc: 'Play a video from your disk', icon: '▣' },
+  { id: 'fade', label: 'Color Fade', desc: 'Instant solid-color cover', icon: '◐' },
+  { id: 'glitch', label: 'Glitch', desc: 'Show the desktop with interference', icon: '⌁' },
+  { id: 'launch_app', label: 'Launch App', desc: 'Start a configured program', icon: '↗' },
+  { id: 'combo', label: 'Combo', desc: 'Layer a disguise with visual effects', icon: '✦' },
 ];
 
-export const COMBO_OPTIONS: { id: ComboMode; label: string; desc: string }[] = [
-  { id: 'fade', label: 'Color fade', desc: 'Adds an opaque cover layer' },
-  { id: 'youtube', label: 'YouTube', desc: 'Use a web video as the disguise' },
-  { id: 'local', label: 'Local video', desc: 'Use a local file as the disguise' },
-  { id: 'glitch', label: 'Glitch', desc: 'Use the pre-panic desktop image' },
-  { id: 'launch_app', label: 'Launch app', desc: 'Start a companion application' },
+export const COMBO_OPTIONS: { id: ComboMode; label: string; desc: string; icon: string }[] = [
+  { id: 'fade', label: 'Color fade', desc: 'Adds a cover layer over the disguise', icon: '◐' },
+  { id: 'youtube', label: 'YouTube', desc: 'Use a web video as the base', icon: '▶' },
+  { id: 'local', label: 'Local video', desc: 'Use a local video as the base', icon: '▣' },
+  { id: 'glitch', label: 'Glitch', desc: 'Use the pre-panic desktop image', icon: '⌁' },
+  { id: 'launch_app', label: 'Launch app', desc: 'Start a companion application', icon: '↗' },
 ];
